@@ -21,6 +21,33 @@ def pure_rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return (xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)).to(x.dtype)
 
 
+@torch.compile
+def _fused_sampled_softcap_ce(
+    h_l: torch.Tensor,
+    w_y: torch.Tensor,
+    w_cand: torch.Tensor,
+    y_l: torch.Tensor,
+    cand_ids: torch.Tensor,
+    log_kc: torch.Tensor,
+    eff_w_l: torch.Tensor,
+    softcap: float,
+) -> torch.Tensor:
+    raw_true = (h_l.float() * w_y.float()).sum(dim=-1)
+    raw_cand = torch.matmul(h_l, w_cand.t()).float()
+    if softcap > 0.0:
+        inv_sc = 1.0 / softcap
+        lg_true = softcap * torch.tanh(raw_true * inv_sc)
+        lg_cand = softcap * torch.tanh(raw_cand * inv_sc)
+    else:
+        lg_true, lg_cand = raw_true, raw_cand
+
+    is_same  = (cand_ids.unsqueeze(0) == y_l.unsqueeze(1))
+    adj_cand = torch.where(is_same, torch.full_like(lg_cand, -1e9), lg_cand - log_kc.unsqueeze(0))
+    lse_all  = torch.logaddexp(lg_true, torch.logsumexp(adj_cand, dim=-1))
+    nll_l    = lse_all - lg_true
+    return (nll_l * eff_w_l).sum() / eff_w_l.sum().clamp_min(1.0)
+
+
 class Wave8SteinJLensController:
     def __init__(
         self,
@@ -216,22 +243,9 @@ class Wave8SteinJLensController:
             parts = [torch.matmul(x_stk[l_i, c0:c1], j_det[l_i, h_k]) for (h_k, c0, c1) in slices_l]
             h_l   = (torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]) * out_sc.unsqueeze(0)
             y_l   = y_lk[l_i]
-
-            raw_true = (h_l.float() * w_emb[y_l].float()).sum(dim=-1)
-            raw_cand = torch.matmul(h_l, w_cand.t()).float()
-            if self.softcap > 0.0:
-                inv_sc = 1.0 / self.softcap
-                lg_true = self.softcap * torch.tanh(raw_true * inv_sc)
-                lg_cand = self.softcap * torch.tanh(raw_cand * inv_sc)
-            else:
-                lg_true, lg_cand = raw_true, raw_cand
-
-            is_same  = (cand_ids.unsqueeze(0) == y_l.unsqueeze(1))
-            adj_cand = torch.where(is_same, torch.full_like(lg_cand, -1e9), lg_cand - log_kc.unsqueeze(0))
-            lse_all  = torch.logaddexp(lg_true, torch.logsumexp(adj_cand, dim=-1))
-            nll_l    = lse_all - lg_true
-            w_l      = eff_w[l_i]
-            layer_losses.append((nll_l * w_l).sum() / w_l.sum().clamp_min(1.0))
+            layer_losses.append(
+                _fused_sampled_softcap_ce(h_l, w_emb[y_l], w_cand, y_l, cand_ids, log_kc, eff_w[l_i], float(self.softcap))
+            )
 
         j_loss = torch.stack(layer_losses).mean()
         return j_loss, j_loss.detach()
