@@ -1,0 +1,40 @@
+# Never commit secrets, credentials, or local environment files
+.env
+.env.*
+*.env
+*.key
+*.pem
+*.p12
+credentials.json
+secrets.*
+.secrets*
+auth.json
+hosts.yml
+featherless-cloud*.yaml
+featherless-cloud*.json
+
+# Python / build / checkpoints
+__pycache__/
+*.py[cod]
+*.so
+.Python
+venv/
+.venv/
+build/
+dist/
+*.egg-info/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.npy
+.DS_Store
+tmp/
+/data/
+
+# Keep compact compressed run logs & manifest tracked in git!
+!logs/.gitkeep
+!logs/*.jsonl.gz
+!runs/manifest.jsonl
+!runs/submissions.jsonl
