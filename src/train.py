@@ -168,6 +168,7 @@ def main():
 
     device = torch.device("cuda")
     torch.manual_seed(args.seed)
+    torch._dynamo.config.cache_size_limit = 64
 
     data_dir = Path(args.data_dir)
     val_arr  = load_fineweb_shard(data_dir / "fineweb_val_000000.bin")

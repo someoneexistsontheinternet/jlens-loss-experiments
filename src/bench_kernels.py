@@ -110,6 +110,8 @@ def bench_full_70m_steps(logger):
     ]
     print("\n=== Full 70M NanoGPT End-to-End Step Shootout (262,144 tok/step, mb=256) ===", flush=True)
     for label, lmode, bk, emode, h2d, comp in step_modes:
+        torch._dynamo.reset()
+        torch._dynamo.config.cache_size_limit = 64
         torch.cuda.empty_cache()
         cfg = NanoGPT70MConfig(linear_mode=lmode, fp8_block_k=bk, e8m0_mode=emode, hier_w_2d=h2d)
         raw_m = NanoGPT70M(cfg).to(device)

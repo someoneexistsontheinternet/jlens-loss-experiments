@@ -403,18 +403,33 @@ def quantize_hier_bf16_fp32(x_2d: torch.Tensor, block_k: int = 128, tile_2d: boo
     return q, s_blk, s_row
 
 
+@triton.jit
+def _col_amax_strided_kernel(
+    x_ptr, s_col_ptr, R, C, R_SAMPLES: tl.constexpr, R_STRIDE,
+    INV_FP8_MAX: tl.constexpr, BLOCK_C: tl.constexpr,
+):
+    """Fast O(1) strided column scale estimator for Hierarchical FP8 (centers BF16 block scales near 1.0)."""
+    pid_c = tl.program_id(0).to(tl.int64)
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    mask_c = offs_c < C
+    offs_r = tl.arange(0, R_SAMPLES).to(tl.int64) * R_STRIDE
+    mask = (offs_r[:, None] < R) & mask_c[None, :]
+    x = tl.load(x_ptr + offs_r[:, None] * C + offs_c[None, :], mask=mask, other=0.0).to(tl.float32)
+    cmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-12) * INV_FP8_MAX
+    tl.store(s_col_ptr + offs_c, cmax, mask=mask_c)
+
+
 def quantize_transpose_hier_bf16_fp32(x_rc: torch.Tensor, block_k: int = 128):
     R, C = x_rc.shape
     assert R % block_k == 0, f"R={R} must be divisible by block_k={block_k}"
     x_c = x_rc if x_rc.is_contiguous() else x_rc.contiguous()
-    BR_MAX = 256 if R >= 4096 else 64
-    BC_MAX = 64
-    n_rb = triton.cdiv(R, BR_MAX)
-    part = torch.empty((n_rb, C), dtype=torch.float32, device=x_c.device)
-    _col_amax_partial_kernel[(n_rb, triton.cdiv(C, BC_MAX))](
-        x_c, part, R, C, BLOCK_R=BR_MAX, BLOCK_C=BC_MAX, num_warps=4
+    s_col = torch.empty((C,), dtype=torch.float32, device=x_c.device)
+    r_samp = 256 if R >= 256 else 64
+    r_stride = max(1, R // r_samp)
+    _col_amax_strided_kernel[(triton.cdiv(C, 64),)](
+        x_c, s_col, R, C, R_SAMPLES=r_samp, R_STRIDE=r_stride,
+        INV_FP8_MAX=1.0 / FP8_MAX, BLOCK_C=64, num_warps=4,
     )
-    s_col = (part.amax(dim=0).clamp_min(1e-12) * (1.0 / FP8_MAX)).contiguous()
     qt = torch.empty((C, R), dtype=TORCH_FP8_DTYPE, device=x_c.device)
     s_blk_t = torch.empty((C, R // block_k), dtype=torch.bfloat16, device=x_c.device)
     BC = 64 if block_k <= 64 else 32
@@ -430,10 +445,10 @@ def quantize_transpose_hier_bf16_fp32(x_rc: torch.Tensor, block_k: int = 128):
 # 2. CDNA3 (gfx942) MFMA Autotuned + Deterministic Split-K Block-Scaled FP8 GEMMs
 # ==============================================================================
 
-def _make_rocm_cfg(kw: dict, num_warps: int, num_stages: int, waves_per_eu: int, matrix_instr_nonkdim: int):
+def _make_rocm_cfg(kw: dict, num_warps: int, num_stages: int, waves_per_eu: int, matrix_instr_nonkdim: int, kpack: int = 1):
     try:
         return triton.Config(kw, num_warps=num_warps, num_stages=num_stages,
-                             waves_per_eu=waves_per_eu, matrix_instr_nonkdim=matrix_instr_nonkdim)
+                             waves_per_eu=waves_per_eu, matrix_instr_nonkdim=matrix_instr_nonkdim, kpack=kpack)
     except TypeError:
         return triton.Config(kw, num_warps=num_warps, num_stages=num_stages)
 
@@ -441,13 +456,15 @@ def _make_rocm_cfg(kw: dict, num_warps: int, num_stages: int, waves_per_eu: int,
 def _build_gemm_configs():
     if IS_GFX942:
         return [
-            _make_rocm_cfg({"BLOCK_M": 256, "BLOCK_N": 128, "GROUP_M": 8}, num_warps=4, num_stages=2, waves_per_eu=2, matrix_instr_nonkdim=16),
-            _make_rocm_cfg({"BLOCK_M": 128, "BLOCK_N": 256, "GROUP_M": 8}, num_warps=4, num_stages=2, waves_per_eu=2, matrix_instr_nonkdim=16),
-            _make_rocm_cfg({"BLOCK_M": 256, "BLOCK_N": 256, "GROUP_M": 4}, num_warps=8, num_stages=2, waves_per_eu=0, matrix_instr_nonkdim=16),
-            _make_rocm_cfg({"BLOCK_M": 128, "BLOCK_N": 128, "GROUP_M": 8}, num_warps=4, num_stages=2, waves_per_eu=2, matrix_instr_nonkdim=16),
-            _make_rocm_cfg({"BLOCK_M": 128, "BLOCK_N": 128, "GROUP_M": 8}, num_warps=8, num_stages=2, waves_per_eu=0, matrix_instr_nonkdim=32),
-            _make_rocm_cfg({"BLOCK_M": 64,  "BLOCK_N": 128, "GROUP_M": 8}, num_warps=4, num_stages=2, waves_per_eu=2, matrix_instr_nonkdim=16),
-            _make_rocm_cfg({"BLOCK_M": 128, "BLOCK_N": 64,  "GROUP_M": 8}, num_warps=4, num_stages=2, waves_per_eu=2, matrix_instr_nonkdim=16),
+            _make_rocm_cfg({"BLOCK_M": 256, "BLOCK_N": 128, "GROUP_M": 8}, num_warps=4, num_stages=2, waves_per_eu=2, matrix_instr_nonkdim=16, kpack=1),
+            _make_rocm_cfg({"BLOCK_M": 256, "BLOCK_N": 128, "GROUP_M": 8}, num_warps=4, num_stages=2, waves_per_eu=2, matrix_instr_nonkdim=16, kpack=2),
+            _make_rocm_cfg({"BLOCK_M": 128, "BLOCK_N": 256, "GROUP_M": 8}, num_warps=4, num_stages=2, waves_per_eu=2, matrix_instr_nonkdim=16, kpack=1),
+            _make_rocm_cfg({"BLOCK_M": 128, "BLOCK_N": 256, "GROUP_M": 8}, num_warps=4, num_stages=2, waves_per_eu=2, matrix_instr_nonkdim=16, kpack=2),
+            _make_rocm_cfg({"BLOCK_M": 256, "BLOCK_N": 256, "GROUP_M": 4}, num_warps=8, num_stages=2, waves_per_eu=0, matrix_instr_nonkdim=16, kpack=2),
+            _make_rocm_cfg({"BLOCK_M": 128, "BLOCK_N": 128, "GROUP_M": 8}, num_warps=4, num_stages=2, waves_per_eu=2, matrix_instr_nonkdim=16, kpack=2),
+            _make_rocm_cfg({"BLOCK_M": 128, "BLOCK_N": 128, "GROUP_M": 8}, num_warps=8, num_stages=2, waves_per_eu=0, matrix_instr_nonkdim=32, kpack=2),
+            _make_rocm_cfg({"BLOCK_M": 64,  "BLOCK_N": 128, "GROUP_M": 8}, num_warps=4, num_stages=2, waves_per_eu=2, matrix_instr_nonkdim=16, kpack=1),
+            _make_rocm_cfg({"BLOCK_M": 128, "BLOCK_N": 64,  "GROUP_M": 8}, num_warps=4, num_stages=2, waves_per_eu=2, matrix_instr_nonkdim=16, kpack=1),
         ]
     return [
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "GROUP_M": 8}, num_warps=8, num_stages=2),
