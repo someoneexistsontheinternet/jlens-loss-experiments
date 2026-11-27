@@ -227,12 +227,13 @@ def select_diverse_fast(
       valid   : [B, k] bool
     """
     M_pool = min(pool_size, logq.shape[-1])
-    pool   = logq.topk(M_pool, dim=-1).indices                  # [B, M]
-    w_pool, d_pool, u_sim = lens.candidate_vectors(pool, metric=metric)
-    B, _, D = w_pool.shape
+    with torch.amp.autocast(device_type=logq.device.type, enabled=False):
+        pool   = logq.float().topk(M_pool, dim=-1).indices          # [B, M]
+        w_pool, d_pool, u_sim = lens.candidate_vectors(pool, metric=metric)
+        B, _, D = w_pool.shape
 
-    sim_norms = u_sim.norm(dim=-1)                              # [B, M]
-    cos_mat   = torch.matmul(u_sim, u_sim.transpose(-1, -2)).abs()  # [B, M, M]
+        sim_norms = u_sim.float().norm(dim=-1)                      # [B, M]
+        cos_mat   = torch.matmul(u_sim.float(), u_sim.float().transpose(-1, -2)).abs()  # [B, M, M]
 
     if logq.is_cuda and M_pool <= 64:
         acc_i8 = torch.empty((B, M_pool), dtype=torch.int8, device=logq.device)
@@ -284,62 +285,52 @@ def suppress_oblique_single_and_joint(
     strength: float = 1.0,
     match_norm: bool = True,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """
-    Builds all `P = k + 2` probe vectors at the intervention position simultaneously:
-      slot 0       : exact clean `x`
-      slots 1..k   : single-feature oblique suppressions `x - s * (<w_j, x> / <w_j, d_j>) * d_j`
-      slot k+1     : joint all-`k` oblique suppression solving `(W^T D + eps I)^{-1} (W^T x)`
-    Returns:
-      x_probes   : [B, k + 2, D] in `x.dtype`
-      usable_k   : [B, k] bool
-      usable_all : [B] bool
-    """
-    B, k, D = w_read.shape
-    xf = x.float()                                              # [B, D]
-    old_norm = xf.norm(dim=-1, keepdim=True)                    # [B, 1]
+    with torch.amp.autocast(device_type=x.device.type, enabled=False):
+        B, k, D = w_read.shape
+        xf = x.float()
+        w_read = w_read.float()
+        d_write = d_write.float()
+        old_norm = xf.norm(dim=-1, keepdim=True)
 
-    if strength <= 0.0:
-        clean_rep = x.unsqueeze(1).expand(B, k + 2, D).contiguous()
-        return clean_rep, valid.clone(), valid.any(dim=-1)
+        if strength <= 0.0:
+            clean_rep = x.unsqueeze(1).expand(B, k + 2, D).contiguous()
+            return clean_rep, valid.clone(), valid.any(dim=-1)
 
-    # 1. Single-direction suppressions [B, k, D]
-    wx    = torch.einsum("bkd,bd->bk", w_read, xf)              # [B, k]
-    wd    = (w_read * d_write).sum(dim=-1)                      # [B, k]
-    coeff = torch.where(valid & (wd > 1e-12), strength * (wx / wd.clamp_min(1e-12)), torch.zeros_like(wx))
-    ed_k  = xf.unsqueeze(1) - coeff.unsqueeze(-1) * d_write     # [B, k, D]
-    usable_k = valid & torch.isfinite(ed_k).all(dim=-1) & (wd > 1e-12)
+        wx    = torch.einsum("bkd,bd->bk", w_read, xf)
+        wd    = (w_read * d_write).sum(dim=-1)
+        coeff = torch.where(valid & (wd > 1e-12), strength * (wx / wd.clamp_min(1e-12)), torch.zeros_like(wx))
+        ed_k  = xf.unsqueeze(1) - coeff.unsqueeze(-1) * d_write
+        usable_k = valid & torch.isfinite(ed_k).all(dim=-1) & (wd > 1e-12)
 
-    if match_norm:
-        new_n = ed_k.norm(dim=-1, keepdim=True)                 # [B, k, 1]
-        old_n = old_norm.unsqueeze(1)                           # [B, 1, 1]
-        ok_n  = (old_n[..., 0] > 1e-8) & (new_n[..., 0] > 1e-6 * old_n[..., 0].clamp_min(1e-8))
-        usable_k = usable_k & ok_n
-        ed_k  = ed_k * (old_n / new_n.clamp_min(1e-8))
-    ed_k = torch.where(usable_k.unsqueeze(-1), ed_k, xf.unsqueeze(1))
+        if match_norm:
+            new_n = ed_k.norm(dim=-1, keepdim=True)
+            old_n = old_norm.unsqueeze(1)
+            ok_n  = (old_n[..., 0] > 1e-8) & (new_n[..., 0] > 1e-6 * old_n[..., 0].clamp_min(1e-8))
+            usable_k = usable_k & ok_n
+            ed_k  = ed_k * (old_n / new_n.clamp_min(1e-8))
+        ed_k = torch.where(usable_k.unsqueeze(-1), ed_k, xf.unsqueeze(1))
 
-    # 2. Joint all-k oblique suppression [B, D]
-    w_m = torch.where(usable_k.unsqueeze(-1), w_read, torch.zeros_like(w_read))   # [B, k, D]
-    d_m = torch.where(usable_k.unsqueeze(-1), d_write, torch.zeros_like(d_write)) # [B, k, D]
-    # Gram G = W^T D: [B, k, k], where W has columns w_j (rows of w_m) and D has columns d_j (rows of d_m)
-    gram  = torch.matmul(w_m, d_m.transpose(-1, -2))            # [B, k, k]
-    diag_scale = gram.diagonal(dim1=-2, dim2=-1).abs().amax(dim=-1, keepdim=True).clamp_min(1.0)
-    eye_k = torch.eye(k, dtype=torch.float32, device=x.device).unsqueeze(0)
-    gram_reg = gram + (1e-4 * diag_scale.unsqueeze(-1)) * eye_k
-    rhs   = torch.einsum("bkd,bd->bk", w_m, xf).unsqueeze(-1)   # [B, k, 1]
-    alpha = torch.linalg.solve(gram_reg, rhs).squeeze(-1)       # [B, k]
-    alpha = torch.where(usable_k, alpha, torch.zeros_like(alpha))
-    ed_all = xf - strength * torch.einsum("bk,bkd->bd", alpha, d_m)
-    usable_all = usable_k.any(dim=-1) & torch.isfinite(ed_all).all(dim=-1)
+        w_m = torch.where(usable_k.unsqueeze(-1), w_read, torch.zeros_like(w_read))
+        d_m = torch.where(usable_k.unsqueeze(-1), d_write, torch.zeros_like(d_write))
+        gram  = torch.matmul(w_m, d_m.transpose(-1, -2))
+        diag_scale = gram.diagonal(dim1=-2, dim2=-1).abs().amax(dim=-1, keepdim=True).clamp_min(1.0)
+        eye_k = torch.eye(k, dtype=torch.float32, device=x.device).unsqueeze(0)
+        gram_reg = gram + (1e-4 * diag_scale.unsqueeze(-1)) * eye_k
+        rhs   = torch.einsum("bkd,bd->bk", w_m, xf).unsqueeze(-1)
+        alpha = torch.linalg.solve(gram_reg, rhs).squeeze(-1)
+        alpha = torch.where(usable_k, alpha, torch.zeros_like(alpha))
+        ed_all = xf - strength * torch.einsum("bk,bkd->bd", alpha, d_m)
+        usable_all = usable_k.any(dim=-1) & torch.isfinite(ed_all).all(dim=-1)
 
-    if match_norm:
-        new_na = ed_all.norm(dim=-1, keepdim=True)
-        ok_na  = (old_norm[:, 0] > 1e-8) & (new_na[:, 0] > 1e-6 * old_norm[:, 0].clamp_min(1e-8))
-        usable_all = usable_all & ok_na
-        ed_all = ed_all * (old_norm / new_na.clamp_min(1e-8))
-    ed_all = torch.where(usable_all.unsqueeze(-1), ed_all, xf)
+        if match_norm:
+            new_na = ed_all.norm(dim=-1, keepdim=True)
+            ok_na  = (old_norm[:, 0] > 1e-8) & (new_na[:, 0] > 1e-6 * old_norm[:, 0].clamp_min(1e-8))
+            usable_all = usable_all & ok_na
+            ed_all = ed_all * (old_norm / new_na.clamp_min(1e-8))
+        ed_all = torch.where(usable_all.unsqueeze(-1), ed_all, xf)
 
-    probes = torch.cat([xf.unsqueeze(1), ed_k, ed_all.unsqueeze(1)], dim=1).to(x.dtype)
-    return probes, usable_k, usable_all
+        probes = torch.cat([xf.unsqueeze(1), ed_k, ed_all.unsqueeze(1)], dim=1).to(x.dtype)
+        return probes, usable_k, usable_all
 
 
 def compute_feature_loss_pregathered(
@@ -575,37 +566,36 @@ class CausalAblationJLensController:
     @torch.no_grad()
     def refresh_snapshot(self, raw_model: nn.Module, interm_det: list[Tensor], x_raw_final: Tensor):
         """Updates frozen `[out_norm, tok_emb]` readout + Stein `J_l` (`x @ J.T ~ x_final`) + covariance `Sigma_l`."""
-        self.readout.copy_from_(raw_model.out_norm.weight, raw_model.tok_emb.weight)
+        with torch.amp.autocast(device_type=x_raw_final.device.type, enabled=False):
+            self.readout.copy_from_(raw_model.out_norm.weight, raw_model.tok_emb.weight)
 
-        B, T, D = x_raw_final.shape
-        M_tot   = B * T
-        K_r     = min(4096, M_tot)
-        ridx    = torch.randint(0, M_tot, (K_r,), device=x_raw_final.device)
-        y_fin   = x_raw_final.reshape(M_tot, D)[ridx].float()
-        y_c     = y_fin - y_fin.mean(dim=0, keepdim=True)
+            B, T, D = x_raw_final.shape
+            M_tot   = B * T
+            K_r     = min(4096, M_tot)
+            ridx    = torch.randint(0, M_tot, (K_r,), device=x_raw_final.device)
+            y_fin   = x_raw_final.reshape(M_tot, D)[ridx].float()
+            y_c     = y_fin - y_fin.mean(dim=0, keepdim=True)
 
-        alpha = self.ema if self._initialized else 0.0
-        eye   = torch.eye(D, dtype=torch.float32, device=x_raw_final.device)
+            alpha = self.ema if self._initialized else 0.0
+            eye   = torch.eye(D, dtype=torch.float32, device=x_raw_final.device)
 
-        for layer_idx, lens in ((self.early_layer, self.lens_early), (self.anchor_layer, self.lens_anchor)):
-            x_l = interm_det[layer_idx - 1].reshape(M_tot, D)[ridx].float()
-            x_c = x_l - x_l.mean(dim=0, keepdim=True)
-            cov = (x_c.t() @ x_c) * (1.0 / float(K_r))
-            trace_avg = cov.diagonal().mean().clamp_min(1e-6)
-            cov_reg   = cov + (self.ridge * trace_avg) * eye
+            for layer_idx, lens in ((self.early_layer, self.lens_early), (self.anchor_layer, self.lens_anchor)):
+                x_l = interm_det[layer_idx - 1].reshape(M_tot, D)[ridx].float()
+                x_c = x_l - x_l.mean(dim=0, keepdim=True)
+                cov = (x_c.t() @ x_c) * (1.0 / float(K_r))
+                trace_avg = cov.diagonal().mean().clamp_min(1e-6)
+                cov_reg   = cov + (self.ridge * trace_avg) * eye
 
-            # Solve X_c @ W_map = Y_c -> W_map = cov_reg^{-1} (X_c^T Y_c / K_r), and `J = W_map^T` so `x @ J.T` predicts `y`!
-            cxy   = (x_c.t() @ y_c) * (1.0 / float(K_r))
-            chol  = torch.linalg.cholesky(cov_reg)
-            w_map = torch.cholesky_solve(cxy, chol)
-            j_new = w_map.t().contiguous()
+                cxy   = (x_c.t() @ y_c) * (1.0 / float(K_r))
+                chol  = torch.linalg.cholesky(cov_reg)
+                w_map = torch.cholesky_solve(cxy, chol)
+                j_new = w_map.t().contiguous()
 
-            # Normalize Sigma by mean variance so oblique scales stay O(1) while preserving condition-number ratios:
-            sig_new = cov / trace_avg + 0.02 * eye
-            lens.J.mul_(alpha).add_(j_new, alpha=(1.0 - alpha))
-            lens.Sigma.mul_(alpha).add_(sig_new, alpha=(1.0 - alpha))
+                sig_new = cov / trace_avg + 0.02 * eye
+                lens.J.mul_(alpha).add_(j_new, alpha=(1.0 - alpha))
+                lens.Sigma.mul_(alpha).add_(sig_new, alpha=(1.0 - alpha))
 
-        self._initialized = True
+            self._initialized = True
 
     @torch.no_grad()
     def select_probe_sequences_and_positions(self, yb: Tensor, tok_nll_det: Tensor) -> tuple[Tensor, Tensor]:

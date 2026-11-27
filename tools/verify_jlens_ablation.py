@@ -129,10 +129,12 @@ def main():
     assert st0["u_anc_abs"] == 0.0 and st0["u_ear_abs"] == 0.0 and float(aux0.item()) == 0.0
     ctrl.strength = 1.0
 
-    # Full backward finiteness & frozen readout check:
+    # Full backward finiteness & frozen readout check (including under BF16 autocast!):
     model.zero_grad(set_to_none=True)
-    ce_loss, tok_nll, interm, x_raw = model(xb, yb, return_interm=True)
-    aux, _, st = ctrl.compute_loss(model, interm, yb, tok_nll)
+    with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
+        ce_loss, tok_nll, interm, x_raw = model(xb, yb, return_interm=True)
+        ctrl.refresh_snapshot(model, [t.detach() for t in interm], x_raw)
+        aux, _, st = ctrl.compute_loss(model, interm, yb, tok_nll)
     (ce_loss + 0.05 * aux).backward()
     assert torch.isfinite(aux)
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
