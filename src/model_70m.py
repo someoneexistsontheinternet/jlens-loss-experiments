@@ -28,6 +28,8 @@ class NanoGPT70MConfig:
     softcap: float      = 30.0
     linear_mode: str    = "bf16"   # "bf16" | "fp8_rowwise" | "mxfp8_e8m0" | "fp8_hier_bf16_fp32"
     fp8_block_k: int    = 128
+    e8m0_mode: str      = "ceil_240"
+    hier_w_2d: bool     = False
     jlens_mode: str     = "none"   # "none" | "wave8"
     jlens_weight: float = 0.35
     ce_backend: str     = "triton" # "triton" (fused in-place row softcap CE) | "eager"
@@ -218,15 +220,16 @@ class NanoGPTBlock(nn.Module):
         res_std  = (1.0 / math.sqrt(2.0 * cfg.n_layers)) / math.sqrt(D)
         down_std = (1.0 / math.sqrt(2.0 * cfg.n_layers)) / math.sqrt(F_d)
 
+        kw = dict(mode=cfg.linear_mode, block_k=cfg.fp8_block_k, e8m0_mode=cfg.e8m0_mode, hier_w_2d=cfg.hier_w_2d)
         self.attn_norm = FastRMSNorm(D)
-        self.wqkv      = QuantLinear(D, 3 * D, mode=cfg.linear_mode, block_k=cfg.fp8_block_k)
+        self.wqkv      = QuantLinear(D, 3 * D, **kw)
         self.q_norm    = FastRMSNorm(cfg.head_dim)
         self.k_norm    = FastRMSNorm(cfg.head_dim)
-        self.wo        = QuantLinear(D, D, mode=cfg.linear_mode, block_k=cfg.fp8_block_k, std=res_std)
+        self.wo        = QuantLinear(D, D, std=res_std, **kw)
 
         self.mlp_norm  = FastRMSNorm(D)
-        self.wgu       = QuantLinear(D, 2 * F_d, mode=cfg.linear_mode, block_k=cfg.fp8_block_k)
-        self.wdown     = QuantLinear(F_d, D, mode=cfg.linear_mode, block_k=cfg.fp8_block_k, std=down_std)
+        self.wgu       = QuantLinear(D, 2 * F_d, **kw)
+        self.wdown     = QuantLinear(F_d, D, std=down_std, **kw)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape

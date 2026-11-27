@@ -143,6 +143,8 @@ def main():
     ap.add_argument("--log-dir",  default=os.environ.get("DATA_ROOT", "/data") + "/logs")
     ap.add_argument("--linear-mode", default="bf16", choices=["bf16", "fp8_rowwise", "mxfp8_e8m0", "fp8_hier_bf16_fp32"])
     ap.add_argument("--fp8-block-k", type=int, default=128)
+    ap.add_argument("--e8m0-mode", default="ceil_240", choices=["ceil_240", "ceil_pow2", "rne_240", "sr_240"])
+    ap.add_argument("--hier-w-2d", type=int, default=0)
     ap.add_argument("--jlens-mode", default="none", choices=["none", "wave8"])
     ap.add_argument("--jlens-weight", type=float, default=0.35)
     ap.add_argument("--jlens-upd-every", type=int, default=25)
@@ -177,6 +179,8 @@ def main():
         seq_len=args.seq_len,
         linear_mode=args.linear_mode,
         fp8_block_k=args.fp8_block_k,
+        e8m0_mode=args.e8m0_mode,
+        hier_w_2d=bool(args.hier_w_2d),
         jlens_mode=args.jlens_mode,
         jlens_weight=args.jlens_weight,
         ce_backend=args.ce_backend,
