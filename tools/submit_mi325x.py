@@ -8,6 +8,7 @@ Commit-pinned Featherless MI325X job submitter.
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -20,8 +21,17 @@ FLS_BIN   = os.environ.get("FEATHERLESS_BIN", str(Path.home() / ".local/bin/feat
 
 
 def sh(cmd: list[str], check: bool = True) -> str:
-    r = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, check=check)
+    r = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, check=False)
+    if check and r.returncode != 0:
+        sys.stderr.write(f"[sh error] cmd={' '.join(cmd)}\nstdout: {r.stdout}\nstderr: {r.stderr}\n")
+        raise subprocess.CalledProcessError(r.returncode, cmd, output=r.stdout, stderr=r.stderr)
     return r.stdout.strip()
+
+
+def sanitize_job_name(raw: str) -> str:
+    s = re.sub(r"[^a-z0-9-]+", "-", raw.lower()).strip("-")
+    s = re.sub(r"-{2,}", "-", s)
+    return s[:63].strip("-")
 
 
 def main():
@@ -44,7 +54,11 @@ def main():
     if not (REPO_ROOT / script_rel).is_file():
         sys.exit(f"Script not found: {script_rel}")
 
-    status = sh(["git", "status", "--porcelain"])
+    status_lines = [
+        ln for ln in sh(["git", "status", "--porcelain"]).splitlines()
+        if ln.strip() and not ln.strip().endswith("runs/submissions.jsonl")
+    ]
+    status = "\n".join(status_lines)
     if status:
         if args.auto_commit:
             sh(["git", "add", "-A"])
@@ -61,7 +75,7 @@ def main():
     commit_sha = sh(["git", "rev-parse", "HEAD"])
     sha7       = commit_sha[:7]
     stem       = Path(script_rel).stem
-    run_id     = args.name or f"{stem}-{sha7}-{int(time.time()) % 100000}"
+    run_id     = sanitize_job_name(args.name or f"{stem}-{sha7}-{int(time.time()) % 100000}")
 
     remote_Bootstrap = (
         f"set -euo pipefail; "

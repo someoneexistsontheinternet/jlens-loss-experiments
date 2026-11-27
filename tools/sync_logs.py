@@ -23,9 +23,10 @@ def main():
     )
 
     records = []
-    tot_bf16_gpu_h = 0.0
-    tot_fp8_gpu_h  = 0.0
-    tot_other_h    = 0.0
+    tot_bf16_gpu_h  = 0.0
+    tot_fp8_gpu_h   = 0.0
+    tot_jlens_gpu_h = 0.0
+    tot_other_h     = 0.0
 
     for gz_path in sorted(LOGS_DIR.glob("*.jsonl.gz")):
         meta, summary = {}, {}
@@ -50,9 +51,16 @@ def main():
         gpu_s = float(summary.get("elapsed_s", last_step.get("elapsed_s", 0.0)))
         gpu_h = gpu_s / 3600.0
         lmode = meta.get("linear_mode", summary.get("linear_mode", "bench"))
+        jmode = meta.get("jlens_mode", summary.get("jlens_mode", "none"))
         kind  = meta.get("kind", summary.get("kind", "train"))
 
-        if "fp8" in str(lmode) or "fp8" in gz_path.name:
+        if jmode and jmode != "none":
+            tot_jlens_gpu_h += gpu_h
+        elif kind == "kernel_bench" and ("fp8" in gz_path.name or "02" in gz_path.name):
+            tot_fp8_gpu_h += gpu_h
+        elif kind == "kernel_bench":
+            tot_bf16_gpu_h += gpu_h
+        elif "fp8" in str(lmode) or "fp8" in gz_path.name:
             tot_fp8_gpu_h += gpu_h
         elif lmode == "bf16" or "bf16" in gz_path.name:
             tot_bf16_gpu_h += gpu_h
@@ -66,8 +74,12 @@ def main():
             "script": meta.get("script", "unknown"),
             "kind": kind,
             "linear_mode": lmode,
+            "jlens_mode": jmode,
+            "jlens_weight": meta.get("jlens_weight", 0.0),
             "opt": meta.get("opt", ""),
             "lr": meta.get("lr", None),
+            "wd": meta.get("wd", None),
+            "toks_per_step": meta.get("toks_per_step", None),
             "steps_done": summary.get("steps", last_step.get("step", 0)),
             "val_ce": summary.get("val_ce", last_step.get("val_ce", None)),
             "tok_per_s": summary.get("tok_per_s", last_step.get("tok_per_s", None)),
@@ -80,9 +92,9 @@ def main():
         for r in records:
             f.write(json.dumps(r) + "\n")
 
-    print("=" * 116)
-    print(f" MI325X BUDGET TRACKER | BF16: {tot_bf16_gpu_h:.2f}/3.00h | FP8 Ablations: {tot_fp8_gpu_h:.2f}/3.00h (min 1.0h) | Misc/Bench: {tot_other_h:.2f}h")
-    print("=" * 116)
+    print("=" * 124)
+    print(f" MI325X BUDGET TRACKER | Stage1 BF16: {tot_bf16_gpu_h:.3f}/3.00h | Stage2 FP8: {tot_fp8_gpu_h:.3f}/3.00h (min 1.0h) | Phase3 J-Lens: {tot_jlens_gpu_h:.3f}h | Misc: {tot_other_h:.3f}h")
+    print("=" * 124)
     print(f"{'Run ID':32s} | {'SHA':7s} | {'Mode':18s} | {'Steps':>5s} | {'Val CE':>8s} | {'ms/st':>7s} | {'tok/s':>8s} | {'GPU-h':>6s}")
     print("-" * 116)
     for r in records:
