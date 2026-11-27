@@ -156,6 +156,7 @@ def main():
     # Phase 4 Causal-Ablation Workspace J-Lens flags:
     ap.add_argument("--abl-early-layer", type=int, default=3)
     ap.add_argument("--abl-anchor-layer", type=int, default=9)
+    ap.add_argument("--abl-active-frac", type=float, default=0.02, help="Fraction of batch tokens probed (e.g. 0.005, 0.02, 0.06, 0.15; 0 uses --abl-probe-seqs)")
     ap.add_argument("--abl-probe-seqs", type=int, default=64)
     ap.add_argument("--abl-pool-size", type=int, default=64)
     ap.add_argument("--abl-k", type=int, default=8)
@@ -232,6 +233,7 @@ def main():
             device=device,
             early_layer=args.abl_early_layer,
             anchor_layer=args.abl_anchor_layer,
+            active_frac=args.abl_active_frac,
             probe_seqs=args.abl_probe_seqs,
             pool_size=args.abl_pool_size,
             k_dirs=args.abl_k,
@@ -260,6 +262,7 @@ def main():
     if args.jlens_mode == "ablation":
         abl_meta = {
             "abl_layers": f"{args.abl_early_layer}->{args.abl_anchor_layer}" if args.abl_enable_early else f"anc{args.abl_anchor_layer}",
+            "abl_active_frac": args.abl_active_frac,
             "abl_probe_seqs": args.abl_probe_seqs,
             "abl_k": args.abl_k,
             "abl_window": args.abl_window,
@@ -358,7 +361,9 @@ def main():
                     j_loss, j_obs, abl_stats_last = jlens_ctrl.compute_loss(raw_model, interm, yb, tok_nll)
                     tot_loss = ce_loss + (args.jlens_weight * j_cos) * j_loss
                     jl_sum += float(j_obs.item()) / grad_accum
-                    extra_jlens_flops_tot += jlens_ctrl.estimate_call_flops(args.micro_batch)
+                    extra_jlens_flops_tot += jlens_ctrl.estimate_call_flops(
+                        args.micro_batch, abl_stats_last["n_act"], abl_stats_last["n_seqs"]
+                    )
                 elif prewarm_snap and micro_i == 0:
                     ce_loss, _, interm, x_raw = fwd_model(xb, yb, return_interm=True)
                     jlens_ctrl.refresh_snapshot(raw_model, [t.detach() for t in interm], x_raw)
@@ -405,6 +410,7 @@ def main():
 
     full_val = evaluate_val(raw_model, val_arr, eval_tokens=10_485_760, batch_size=min(64, args.micro_batch), device=device)
     med_ms   = float(np.median(steady_ms)) if steady_ms else ms_st
+    mean_ms  = float(np.mean(steady_ms)) if steady_ms else ms_st
     med_toks = toks_step / max(med_ms / 1000.0, 1e-6)
     base_tot_flops  = float(args.steps) * float(toks_step) * float(flops_tok)
     extra_flops_pct = 100.0 * (extra_jlens_flops_tot / max(base_tot_flops, 1.0))
@@ -418,10 +424,11 @@ def main():
         "val_ce": round(full_val, 5),
         "val_ppl": round(math.exp(min(full_val, 20.0)), 3),
         "ms_per_step": round(med_ms, 2),
+        "mean_ms_per_step": round(mean_ms, 2),
         "tok_per_s": round(med_toks, 1),
         "total_tokens": args.steps * toks_step,
     })
-    print(f"=== DONE {run_id} | Full 10.5M Val CE = {full_val:.5f} | ExtraFLOPs = +{extra_flops_pct:.2f}% | Median {med_ms:.1f} ms/st -> {log_p} ===", flush=True)
+    print(f"=== DONE {run_id} | Full 10.5M Val CE = {full_val:.5f} | ExtraFLOPs = +{extra_flops_pct:.2f}% | Mean {mean_ms:.1f} ms/st (Med {med_ms:.1f}) -> {log_p} ===", flush=True)
 
 
 if __name__ == "__main__":

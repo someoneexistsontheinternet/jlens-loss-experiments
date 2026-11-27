@@ -118,7 +118,7 @@ def main():
 
     # 5. End-to-end controller backward & early-probe suffix hook check
     ctrl = CausalAblationJLensController(
-        model, device=device, early_layer=2, anchor_layer=4, probe_seqs=4, pool_size=32, k_dirs=4, window=4
+        model, device=device, early_layer=2, anchor_layer=4, active_frac=0.0, probe_seqs=4, pool_size=32, k_dirs=4, window=4
     )
     ctrl.refresh_snapshot(model, [t.detach() for t in interm], x_raw)
 
@@ -140,6 +140,64 @@ def main():
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
     assert all(p.grad is None for p in ctrl.readout.parameters())
     print("PASS 5: Zero-strength=0 check, finite combined backward, and grad-free frozen readout:", st)
+
+    # 6. Multi-position shared-KV Triton Flash-Prefix (Dh=64) & SelectedSoftcapLinearLogProbsFn grad parity:
+    cfg64 = NanoGPT70MConfig(n_layers=6, d_model=128, n_heads=2, head_dim=64, d_ff=256, vocab_pad=2048, seq_len=64, ce_backend="eager")
+    m64 = NanoGPT70M(cfg64).to(device).eval()
+    xb64 = torch.randint(0, 2000, (4, 64), device=device)
+    yb64 = torch.randint(0, 2000, (4, 64), device=device)
+    _, nll64, int64, xraw64 = m64(xb64, yb64, return_interm=True)
+
+    # Multiple positions sharing the SAME sequence KV cache (b=[0, 0, 1, 2, 2, 3], pos=[0, 19, 31, 7, 52, 40]):
+    b_multi   = torch.tensor([0, 0, 1, 2, 2, 3], device=device)
+    pos_multi = torch.tensor([0, 19, 31, 7, 52, 40], device=device)
+    uniq_b, kv_slot = torch.unique_consecutive(b_multi, return_inverse=True)
+    W64, P64 = 4, 5
+    pert64 = torch.randn((6, P64, 128), device=device, dtype=torch.bfloat16) * 0.2
+    w_idx64 = pos_multi[:, None] + torch.arange(W64, device=device)[None, :]
+    hcl64 = int64[1].detach()[b_multi[:, None], w_idx64]
+    hwin64 = hcl64.unsqueeze(1).expand(6, P64, W64, 128).clone()
+    hwin64[:, :, 0, :] = pert64
+
+    sub64 = m64.blocks[2:5]
+    inp64 = [int64[m - 1].detach() for m in range(2, 5)]
+    kv64 = extract_clean_kv_for_blocks(sub64, inp64, uniq_b, m64.cos, m64.sin)
+    out_flash = advance_local_window_kv(sub64, kv64, hwin64, pos_multi, m64.cos, m64.sin, kv_slot=kv_slot)
+
+    with torch.no_grad():
+        for idx_n in range(6):
+            bi = int(b_multi[idx_n].item())
+            pi = int(pos_multi[idx_n].item())
+            for p_i in range(P64):
+                fh = int64[1].detach()[bi : bi + 1].clone()
+                fh[0, pi] = pert64[idx_n, p_i]
+                for blk in sub64:
+                    fh = blk(fh, m64.cos[:, :, :64, :], m64.sin[:, :, :64, :])
+                torch.testing.assert_close(out_flash[idx_n, p_i], fh[0, pi : pi + W64], atol=2e-2, rtol=2e-2)
+    print("PASS 6: Multi-position shared-KV Triton Flash-Prefix (Dh=64, pos=0..52) matches brute-force full-sequence forward")
+
+    # 7. Differentiable SelectedSoftcapLinearLogProbsFn vs exact FP32 log_probs + multi-position active_frac=0.15 check:
+    ro64 = FrozenSoftcapReadout(m64.out_norm.weight, m64.tok_emb.weight, softcap=30.0).to(device)
+    x_ref = torch.randn((32, 128), device=device, dtype=torch.bfloat16, requires_grad=True)
+    x_fst = x_ref.detach().clone().requires_grad_(True)
+    ids_t = torch.randint(0, 2048, (32, 8), device=device)
+    u_wt  = torch.randn((32, 8), device=device)
+    l_ref = -(ro64.log_probs(x_ref).gather(-1, ids_t) * u_wt).sum()
+    l_ref.backward()
+    l_fst = -(ro64.selected_log_probs(x_fst, ids_t) * u_wt).sum()
+    l_fst.backward()
+    g_cos = float(torch.nn.functional.cosine_similarity(x_ref.grad.float().reshape(1, -1), x_fst.grad.float().reshape(1, -1)).item())
+    assert g_cos > 0.9995, f"SelectedSoftcapLinearLogProbsFn grad cosine too low: {g_cos}"
+
+    ctrl_mp = CausalAblationJLensController(m64, device=device, early_layer=2, anchor_layer=4, active_frac=0.15, k_dirs=4, window=4)
+    m64.train().zero_grad(set_to_none=True)
+    with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
+        ce64, nll64, int64, xraw64 = m64(xb64, yb64, return_interm=True)
+        ctrl_mp.refresh_snapshot(m64, [t.detach() for t in int64], xraw64)
+        aux64, _, st64 = ctrl_mp.compute_loss(m64, int64, yb64, nll64)
+    (ce64 + 0.05 * aux64).backward()
+    assert st64["n_act"] == int(round(0.15 * 4 * 64)) and torch.isfinite(aux64)
+    print(f"PASS 7: SelectedSoftcapLinearLogProbsFn grad_cos={g_cos:.6f} & multi-position active_frac=0.15 passed:", st64)
     print("ALL VERIFICATION CHECKS PASSED.")
 
 

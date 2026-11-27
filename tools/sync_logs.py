@@ -80,6 +80,7 @@ def main():
             "linear_mode": lmode,
             "jlens_mode": jmode,
             "jlens_weight": meta.get("jlens_weight", 0.0),
+            "abl_active_frac": meta.get("abl_active_frac", None),
             "extra_flops_pct": summary.get("extra_flops_pct", 0.0),
             "opt": meta.get("opt", ""),
             "lr": meta.get("lr", None),
@@ -89,6 +90,8 @@ def main():
             "val_ce": summary.get("val_ce", last_step.get("val_ce", None)),
             "tok_per_s": summary.get("tok_per_s", last_step.get("tok_per_s", None)),
             "ms_per_step": summary.get("ms_per_step", last_step.get("ms_per_step", None)),
+            "mean_ms_per_step": summary.get("mean_ms_per_step", None),
+            "elapsed_s": round(gpu_s, 2),
             "gpu_hours": round(gpu_h, 4),
         }
         records.append(rec)
