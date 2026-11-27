@@ -1,6 +1,6 @@
 # Autonomous Handoff Brief — `jlens-loss-experiments` (Mac Mini `home` -> Featherless MI325X)
 
-You are running on the always-on Mac mini (`chenguangs-Mac-mini.local`) inside `~/jlens-loss-experiments`.
+You are running on the always-on Mac mini (`chenguangs-Mac-mini.local`) inside `/Users/chen/Documents/GitHub/jlens-loss-experiments`.
 Both `gh` (authenticated as `someoneexistsontheinternet` via `~/.config/gh/hosts.yml`) and `featherless-cloud` (`~/.local/bin/featherless-cloud`, authenticated via `~/.config/featherless-cloud.yaml`) are installed and ready.
 
 ---
