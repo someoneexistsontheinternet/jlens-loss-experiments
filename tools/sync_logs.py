@@ -24,10 +24,11 @@ def main():
     )
 
     records = []
-    tot_bf16_gpu_h  = 0.0
-    tot_fp8_gpu_h   = 0.0
-    tot_jlens_gpu_h = 0.0
-    tot_other_h     = 0.0
+    tot_bf16_gpu_h   = 0.0
+    tot_fp8_gpu_h    = 0.0
+    tot_jlens_gpu_h  = 0.0
+    tot_phase4_gpu_h = 0.0
+    tot_other_h      = 0.0
 
     for gz_path in sorted(LOGS_DIR.glob("*.jsonl.gz")):
         meta, summary = {}, {}
@@ -55,7 +56,9 @@ def main():
         jmode = meta.get("jlens_mode", summary.get("jlens_mode", "none"))
         kind  = meta.get("kind", summary.get("kind", "train"))
 
-        if jmode and jmode != "none":
+        if jmode == "ablation" or gz_path.name.startswith(("05", "06", "07")):
+            tot_phase4_gpu_h += gpu_h
+        elif jmode and jmode != "none":
             tot_jlens_gpu_h += gpu_h
         elif kind == "kernel_bench" and ("fp8" in gz_path.name or "02" in gz_path.name):
             tot_fp8_gpu_h += gpu_h
@@ -77,6 +80,7 @@ def main():
             "linear_mode": lmode,
             "jlens_mode": jmode,
             "jlens_weight": meta.get("jlens_weight", 0.0),
+            "extra_flops_pct": summary.get("extra_flops_pct", 0.0),
             "opt": meta.get("opt", ""),
             "lr": meta.get("lr", None),
             "wd": meta.get("wd", None),
@@ -93,9 +97,9 @@ def main():
         for r in records:
             f.write(json.dumps(r) + "\n")
 
-    print("=" * 124)
-    print(f" MI325X BUDGET TRACKER | Stage1 BF16: {tot_bf16_gpu_h:.3f}/3.00h | Stage2 FP8: {tot_fp8_gpu_h:.3f}/3.00h (min 1.0h) | Phase3 J-Lens: {tot_jlens_gpu_h:.3f}h | Misc: {tot_other_h:.3f}h")
-    print("=" * 124)
+    print("=" * 132)
+    print(f" MI325X BUDGET TRACKER | Stage1 BF16: {tot_bf16_gpu_h:.3f}/3.00h | Stage2 FP8: {tot_fp8_gpu_h:.3f}/3.00h | Phase3 Wave8: {tot_jlens_gpu_h:.3f}h | Phase4 Ablation: {tot_phase4_gpu_h:.3f}h")
+    print("=" * 132)
     print(f"{'Run ID':32s} | {'SHA':7s} | {'Mode':18s} | {'Steps':>5s} | {'Val CE':>8s} | {'ms/st':>7s} | {'tok/s':>8s} | {'GPU-h':>6s}")
     print("-" * 116)
     for r in records:

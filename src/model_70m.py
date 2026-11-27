@@ -30,7 +30,7 @@ class NanoGPT70MConfig:
     fp8_block_k: int    = 128
     e8m0_mode: str      = "ceil_240"
     hier_w_2d: bool     = False
-    jlens_mode: str     = "none"   # "none" | "wave8"
+    jlens_mode: str     = "none"   # "none" | "wave8" | "ablation"
     jlens_weight: float = 0.35
     ce_backend: str     = "triton" # "triton" (fused in-place row softcap CE) | "eager"
     ce_chunk_sz: int    = 32768

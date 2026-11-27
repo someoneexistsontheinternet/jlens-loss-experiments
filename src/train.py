@@ -15,6 +15,7 @@ import torch.nn as nn
 
 from model_70m import NanoGPT70MConfig, NanoGPT70M
 from jlens_wave8 import Wave8SteinJLensController
+from jlens_ablation import CausalAblationJLensController
 from fp8_kernels import TORCH_FP8_DTYPE, FP8_MAX, IS_GFX942
 from telemetry import CompressedJSONLLogger
 
@@ -145,11 +146,30 @@ def main():
     ap.add_argument("--fp8-block-k", type=int, default=128)
     ap.add_argument("--e8m0-mode", default="ceil_240", choices=["ceil_240", "ceil_pow2", "rne_240", "sr_240"])
     ap.add_argument("--hier-w-2d", type=int, default=0)
-    ap.add_argument("--jlens-mode", default="none", choices=["none", "wave8"])
+    ap.add_argument("--jlens-mode", default="none", choices=["none", "wave8", "ablation"])
     ap.add_argument("--jlens-weight", type=float, default=0.35)
     ap.add_argument("--jlens-horizons", type=int, default=8)
+    ap.add_argument("--jlens-start-frac", type=float, default=0.0)
     ap.add_argument("--jlens-end-frac", type=float, default=1.0)
+    ap.add_argument("--jlens-every", type=int, default=1, help="Apply J-Lens every N steps (reduces FLOP/time tax)")
     ap.add_argument("--jlens-upd-every", type=int, default=25)
+    # Phase 4 Causal-Ablation Workspace J-Lens flags:
+    ap.add_argument("--abl-early-layer", type=int, default=3)
+    ap.add_argument("--abl-anchor-layer", type=int, default=9)
+    ap.add_argument("--abl-probe-seqs", type=int, default=64)
+    ap.add_argument("--abl-pool-size", type=int, default=64)
+    ap.add_argument("--abl-k", type=int, default=8)
+    ap.add_argument("--abl-window", type=int, default=4)
+    ap.add_argument("--abl-max-cosine", type=float, default=0.85)
+    ap.add_argument("--abl-strength", type=float, default=1.0)
+    ap.add_argument("--abl-match-norm", type=int, default=1)
+    ap.add_argument("--abl-metric", default="cov", choices=["cov", "euclidean"])
+    ap.add_argument("--abl-loss-kind", default="superpos_unlikelihood", choices=["superpos_unlikelihood", "unlikelihood", "signed_raw"])
+    ap.add_argument("--abl-coalition-norm", type=int, default=1)
+    ap.add_argument("--abl-hop-norm", type=int, default=1)
+    ap.add_argument("--abl-enable-early", type=int, default=1)
+    ap.add_argument("--abl-pos-mode", default="hard_easy", choices=["hard_easy", "uniform"])
+    ap.add_argument("--abl-detach-prev", type=int, default=0)
     ap.add_argument("--opt", default="muon", choices=["muon", "adamw"])
     ap.add_argument("--muon-lr", type=float, default=0.02)
     ap.add_argument("--adam-lr", type=float, default=3e-3)
@@ -193,9 +213,9 @@ def main():
     n_tot, n_trunk, flops_tok = raw_model.count_params_and_flops()
     fwd_model = torch.compile(raw_model, mode=args.compile_mode) if args.compile else raw_model
 
-    use_jlens = (args.jlens_mode == "wave8")
+    use_jlens = args.jlens_mode in ("wave8", "ablation")
     jlens_ctrl = None
-    if use_jlens:
+    if args.jlens_mode == "wave8":
         jlens_ctrl = Wave8SteinJLensController(
             n_layers=cfg.n_layers,
             d_model=cfg.d_model,
@@ -206,6 +226,27 @@ def main():
             horizons=args.jlens_horizons,
             softcap=cfg.softcap,
         )
+    elif args.jlens_mode == "ablation":
+        jlens_ctrl = CausalAblationJLensController(
+            raw_model=raw_model,
+            device=device,
+            early_layer=args.abl_early_layer,
+            anchor_layer=args.abl_anchor_layer,
+            probe_seqs=args.abl_probe_seqs,
+            pool_size=args.abl_pool_size,
+            k_dirs=args.abl_k,
+            window=args.abl_window,
+            max_cosine=args.abl_max_cosine,
+            strength=args.abl_strength,
+            match_norm=bool(args.abl_match_norm),
+            metric=args.abl_metric,
+            loss_kind=args.abl_loss_kind,
+            coalition_norm=bool(args.abl_coalition_norm),
+            hop_norm=bool(args.abl_hop_norm),
+            enable_early=bool(args.abl_enable_early),
+            pos_mode=args.abl_pos_mode,
+            detach_prev=bool(args.abl_detach_prev),
+        )
 
     grad_accum = max(1, args.batch_tokens // (args.micro_batch * args.seq_len))
     toks_step  = args.micro_batch * args.seq_len * grad_accum
@@ -215,6 +256,19 @@ def main():
     run_id = os.environ.get("RUN_ID", f"train_{args.linear_mode}_{args.jlens_mode}")
     sha7   = os.environ.get("GIT_COMMIT_SHA", "local")[:7]
     log_p  = Path(args.log_dir) / f"{run_id}_{sha7}.jsonl.gz"
+    abl_meta = {}
+    if args.jlens_mode == "ablation":
+        abl_meta = {
+            "abl_layers": f"{args.abl_early_layer}->{args.abl_anchor_layer}" if args.abl_enable_early else f"anc{args.abl_anchor_layer}",
+            "abl_probe_seqs": args.abl_probe_seqs,
+            "abl_k": args.abl_k,
+            "abl_window": args.abl_window,
+            "abl_metric": args.abl_metric,
+            "abl_loss_kind": args.abl_loss_kind,
+            "abl_coalition_norm": args.abl_coalition_norm,
+            "abl_hop_norm": args.abl_hop_norm,
+            "jlens_every": args.jlens_every,
+        }
     logger = CompressedJSONLLogger(log_p, {
         "kind": "train_70m",
         "n_params": n_tot,
@@ -224,7 +278,8 @@ def main():
         "fp8_block_k": args.fp8_block_k,
         "jlens_mode": args.jlens_mode,
         "jlens_weight": args.jlens_weight if use_jlens else 0.0,
-        "jlens_horizons": args.jlens_horizons if use_jlens else 0,
+        "jlens_horizons": args.jlens_horizons if args.jlens_mode == "wave8" else 0,
+        "jlens_start_frac": args.jlens_start_frac if use_jlens else 0.0,
         "jlens_end_frac": args.jlens_end_frac if use_jlens else 1.0,
         "opt": args.opt,
         "lr": args.muon_lr if args.opt == "muon" else args.adam_lr,
@@ -232,13 +287,19 @@ def main():
         "wd": args.wd,
         "toks_per_step": toks_step,
         "steps_target": args.steps,
+        "seed": args.seed,
         "fp8_spec": f"{TORCH_FP8_DTYPE}(max={FP8_MAX},gfx942={IS_GFX942})",
+        **abl_meta,
     })
 
     stable_end = int(args.steps * 0.80)
+    j_start    = int(args.steps * args.jlens_start_frac)
+    j_end      = int(args.steps * args.jlens_end_frac)
     t_win = time.perf_counter()
     last_s = 0
     steady_ms = []
+    extra_jlens_flops_tot = 0.0
+    jlens_active_steps = 0
 
     for step in range(1, args.steps + 1):
         if step < args.warmup:
@@ -250,24 +311,37 @@ def main():
             lr_m  = 0.05 + 0.95 * w_cos
             j_cos = w_cos
 
-        if args.jlens_end_frac < 1.0:
-            j_end = int(args.steps * args.jlens_end_frac)
-            if step <= args.warmup:
-                j_cos = 1.0
-            elif step >= j_end:
+        if args.jlens_start_frac > 0.0 or args.jlens_end_frac < 1.0:
+            eff_start = max(args.warmup if args.jlens_start_frac == 0.0 else j_start, 0)
+            if step < j_start or step >= j_end:
                 j_cos = 0.0
+            elif args.jlens_start_frac > 0.0 and step < j_start + 50:
+                # Smooth 50-step ramp-in once entering log-log regime
+                j_cos = 0.5 * (1.0 - math.cos(math.pi * (step - j_start + 1) / 50.0))
+            elif step <= eff_start:
+                j_cos = 1.0
             else:
-                j_cos = 0.5 * (1.0 + math.cos(math.pi * (step - args.warmup) / max(1, j_end - args.warmup)))
+                j_cos = 0.5 * (1.0 + math.cos(math.pi * (step - eff_start) / max(1, j_end - eff_start)))
 
-        active_jlens = use_jlens and (j_cos > 1e-6)
+        cadence_ok   = ((step - max(1, j_start)) % max(1, args.jlens_every) == 0)
+        active_jlens = use_jlens and (j_cos > 1e-6) and cadence_ok
+        prewarm_snap = (
+            args.jlens_mode == "ablation"
+            and j_start > 0
+            and step in (max(1, j_start - args.jlens_upd_every), max(1, j_start - 1))
+        )
+
         opt.zero_grad()
         ce_sum, jl_sum = 0.0, 0.0
-        cand_ids = jlens_ctrl.sample_vocab_candidates() if active_jlens else None
+        abl_stats_last = None
+        cand_ids = jlens_ctrl.sample_vocab_candidates() if (active_jlens and args.jlens_mode == "wave8") else None
+        if active_jlens:
+            jlens_active_steps += 1
 
         for micro_i in range(grad_accum):
             xb, yb = stream.next_batch(device)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                if active_jlens:
+                if active_jlens and args.jlens_mode == "wave8":
                     ce_loss, tok_nll, interm, x_raw = fwd_model(xb, yb, return_interm=True)
                     if micro_i == 0 and (step == 1 or step % args.jlens_upd_every == 0):
                         jlens_ctrl.refresh_lenses([t.detach() for t in interm], x_raw, yb)
@@ -277,6 +351,18 @@ def main():
                     anchor = (ce_loss.detach() / j_obs.clamp_min(1e-4)).clamp(0.20, 1.0)
                     tot_loss = ce_loss + (args.jlens_weight * j_cos * anchor) * j_loss
                     jl_sum += float(j_obs.item()) / grad_accum
+                elif active_jlens and args.jlens_mode == "ablation":
+                    ce_loss, tok_nll, interm, x_raw = fwd_model(xb, yb, return_interm=True)
+                    if micro_i == 0 and (not jlens_ctrl._initialized or step % args.jlens_upd_every == 0):
+                        jlens_ctrl.refresh_snapshot(raw_model, [t.detach() for t in interm], x_raw)
+                    j_loss, j_obs, abl_stats_last = jlens_ctrl.compute_loss(raw_model, interm, yb, tok_nll)
+                    tot_loss = ce_loss + (args.jlens_weight * j_cos) * j_loss
+                    jl_sum += float(j_obs.item()) / grad_accum
+                    extra_jlens_flops_tot += jlens_ctrl.estimate_call_flops(args.micro_batch)
+                elif prewarm_snap and micro_i == 0:
+                    ce_loss, _, interm, x_raw = fwd_model(xb, yb, return_interm=True)
+                    jlens_ctrl.refresh_snapshot(raw_model, [t.detach() for t in interm], x_raw)
+                    tot_loss = ce_loss
                 else:
                     ce_loss, _ = fwd_model(xb, yb, return_interm=False)
                     tot_loss = ce_loss
@@ -304,30 +390,38 @@ def main():
             }
             if use_jlens:
                 rec["jlens_ce"] = round(jl_sum, 4)
+                rec["j_cos"] = round(j_cos, 3)
+            if abl_stats_last is not None:
+                rec.update(abl_stats_last)
             if do_eval:
                 v_ce = evaluate_val(raw_model, val_arr, eval_tokens=2_097_152, batch_size=min(64, args.micro_batch), device=device)
                 rec["val_ce"] = round(v_ce, 4)
             logger.write(rec)
             v_str = f" | val={rec['val_ce']:.4f}" if "val_ce" in rec else ""
-            j_str = f" | jce={jl_sum:.3f}" if use_jlens else ""
-            print(f"[{run_id}] st {step:4d}/{args.steps} | ce={ce_sum:.4f}{j_str}{v_str} | gn={gnorm:.2f} | {ms_st:.1f}ms/st ({tok_s/1e3:.0f}k tok/s, {tflops:.0f} TF)", flush=True)
+            j_str = f" | jce={jl_sum:.4f}" if use_jlens else ""
+            u_str = f" | |uA|={abl_stats_last['u_anc_abs']:.4f}" if abl_stats_last is not None else ""
+            print(f"[{run_id}] st {step:4d}/{args.steps} | ce={ce_sum:.4f}{j_str}{u_str}{v_str} | gn={gnorm:.2f} | {ms_st:.1f}ms/st ({tok_s/1e3:.0f}k tok/s, {tflops:.0f} TF)", flush=True)
             t_win = time.perf_counter(); last_s = step
 
     full_val = evaluate_val(raw_model, val_arr, eval_tokens=10_485_760, batch_size=min(64, args.micro_batch), device=device)
     med_ms   = float(np.median(steady_ms)) if steady_ms else ms_st
     med_toks = toks_step / max(med_ms / 1000.0, 1e-6)
+    base_tot_flops  = float(args.steps) * float(toks_step) * float(flops_tok)
+    extra_flops_pct = 100.0 * (extra_jlens_flops_tot / max(base_tot_flops, 1.0))
     logger.close({
         "kind": "train_70m",
         "linear_mode": args.linear_mode,
         "jlens_mode": args.jlens_mode,
         "steps": args.steps,
+        "jlens_active_steps": jlens_active_steps,
+        "extra_flops_pct": round(extra_flops_pct, 3),
         "val_ce": round(full_val, 5),
         "val_ppl": round(math.exp(min(full_val, 20.0)), 3),
         "ms_per_step": round(med_ms, 2),
         "tok_per_s": round(med_toks, 1),
         "total_tokens": args.steps * toks_step,
     })
-    print(f"=== DONE {run_id} | Full 10.5M Val CE = {full_val:.5f} | Median {med_ms:.1f} ms/st -> {log_p} ===", flush=True)
+    print(f"=== DONE {run_id} | Full 10.5M Val CE = {full_val:.5f} | ExtraFLOPs = +{extra_flops_pct:.2f}% | Median {med_ms:.1f} ms/st -> {log_p} ===", flush=True)
 
 
 if __name__ == "__main__":
