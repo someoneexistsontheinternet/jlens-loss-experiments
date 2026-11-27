@@ -69,7 +69,7 @@ class HybridMuonAdamW:
         self.base_muon_lr = muon_lr
         self.wd = wd
         self.muon_params = []
-        adam_emb, adam_other = [], []
+        adam_emb, adam_2d, adam_1d = [], [], []
 
         for name, p in model.named_parameters():
             if not p.requires_grad:
@@ -78,13 +78,16 @@ class HybridMuonAdamW:
                 self.muon_params.append(p)
             elif "tok_emb" in name:
                 adam_emb.append(p)
+            elif p.ndim >= 2:
+                adam_2d.append(p)
             else:
-                adam_other.append(p)
+                adam_1d.append(p)
 
         self.muon_bufs = [torch.zeros_like(p, dtype=torch.float32) for p in self.muon_params]
         groups = [
-            {"params": adam_emb,   "lr": adam_lr * 0.8, "base_lr": adam_lr * 0.8, "weight_decay": 0.01},
-            {"params": adam_other, "lr": adam_lr,       "base_lr": adam_lr,       "weight_decay": (wd if opt_kind == "adamw" else 0.0)},
+            {"params": adam_emb, "lr": adam_lr * 0.8, "base_lr": adam_lr * 0.8, "weight_decay": 0.01},
+            {"params": adam_2d,  "lr": adam_lr,       "base_lr": adam_lr,       "weight_decay": wd},
+            {"params": adam_1d,  "lr": adam_lr,       "base_lr": adam_lr,       "weight_decay": 0.0},
         ]
         self.adam = torch.optim.AdamW([g for g in groups if g["params"]], betas=(0.9, 0.95))
 
