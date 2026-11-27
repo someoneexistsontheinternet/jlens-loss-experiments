@@ -22,11 +22,60 @@ import math
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from model_70m import apply_rope
 
 RHO_HARMONIC = 3.0 / math.sqrt(5.0 * math.pi)  # 0.75694...
 EOT_TOKEN    = 50256
+
+
+@triton.jit
+def _softcap_lse_nograd_kernel(
+    logits_ptr, stride_m, lse_ptr,
+    V: tl.constexpr, SOFTCAP: tl.constexpr, INV_SOFTCAP: tl.constexpr, BLOCK_V: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    row_ptr = logits_ptr + row * stride_m
+    m_i = -float("inf")
+    d_i = 0.0
+    LOG2E: tl.constexpr = 1.4426950408889634
+    for start_v in range(0, V, BLOCK_V):
+        offs_v = start_v + tl.arange(0, BLOCK_V)
+        mask_v = offs_v < V
+        raw = tl.load(row_ptr + offs_v, mask=mask_v, other=-float("inf")).to(tl.float32)
+        if SOFTCAP > 0.0:
+            z = tl.minimum(tl.maximum(raw * INV_SOFTCAP, -20.0), 20.0)
+            e2z = tl.math.exp2(2.0 * LOG2E * z)
+            lg = tl.where(mask_v, SOFTCAP * ((e2z - 1.0) / (e2z + 1.0)), -float("inf"))
+        else:
+            lg = raw
+        blk_max = tl.max(lg, axis=0)
+        m_new = tl.maximum(m_i, blk_max)
+        d_i = d_i * tl.math.exp2((m_i - m_new) * LOG2E) + tl.sum(tl.math.exp2((lg - m_new) * LOG2E), axis=0)
+        m_i = m_new
+    tl.store(lse_ptr + row, m_i + tl.math.log(d_i))
+
+
+@triton.jit
+def _greedy_diverse_accept_kernel(
+    sim_norms_ptr, cos_mat_ptr, accepted_ptr,
+    M_pool, k_max, max_cos, BLOCK_M: tl.constexpr,
+):
+    b = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK_M)
+    acc_mask = tl.zeros((BLOCK_M,), dtype=tl.int32)
+    n_acc = 0
+    for j in range(0, M_pool):
+        sn = tl.load(sim_norms_ptr + b * M_pool + j)
+        cos_row = tl.load(cos_mat_ptr + b * M_pool * M_pool + j * M_pool + offs, mask=(offs < j), other=0.0)
+        conflict = tl.max(tl.where((offs < j) & (acc_mask > 0) & (cos_row > max_cos), 1, 0), axis=0)
+        take = (sn > 0.5) & (conflict == 0) & (n_acc < k_max)
+        take_i = tl.where(take, 1, 0)
+        acc_mask = tl.where(offs == j, take_i, acc_mask)
+        n_acc += take_i
+    tl.store(accepted_ptr + b * M_pool + offs, acc_mask.to(tl.int8), mask=(offs < M_pool))
 
 
 def pure_rms_norm_fp32(x: Tensor, eps: float = 1e-6) -> Tensor:
@@ -35,7 +84,7 @@ def pure_rms_norm_fp32(x: Tensor, eps: float = 1e-6) -> Tensor:
 
 
 class FrozenSoftcapReadout(nn.Module):
-    """Frozen snapshot of final RMSNorm + tied unembedding + logit softcap."""
+    """Frozen snapshot of final RMSNorm + tied unembedding + logit softcap (with fast BF16-MFMA + Triton no-grad path)."""
 
     def __init__(self, norm_weight: Tensor, unemb_weight: Tensor, softcap: float = 30.0, eps: float = 1e-6):
         super().__init__()
@@ -43,11 +92,13 @@ class FrozenSoftcapReadout(nn.Module):
         self.eps     = float(eps)
         self.register_buffer("norm_w", norm_weight.detach().float().clone())
         self.register_buffer("U", unemb_weight.detach().float().clone())
+        self.register_buffer("U_bf16", unemb_weight.detach().to(torch.bfloat16).clone())
 
     @torch.no_grad()
     def copy_from_(self, norm_weight: Tensor, unemb_weight: Tensor):
         self.norm_w.copy_(norm_weight.detach().float())
         self.U.copy_(unemb_weight.detach().float())
+        self.U_bf16.copy_(unemb_weight.detach().to(torch.bfloat16))
 
     def logits(self, h: Tensor) -> Tensor:
         with torch.amp.autocast(device_type=h.device.type, enabled=False):
@@ -60,6 +111,61 @@ class FrozenSoftcapReadout(nn.Module):
 
     def log_probs(self, h: Tensor) -> Tensor:
         return self.logits(h).log_softmax(dim=-1)
+
+    @torch.no_grad()
+    def fast_nograd_target_nll(self, h_2d: Tensor, targets_1d: Tensor, chunk_sz: int = 8192) -> Tensor:
+        """Fast BF16-MFMA + 1-pass Triton online-LSE gold NLL for `[N, D]` probe states."""
+        if not h_2d.is_cuda or self.U_bf16.shape[0] < 1024:
+            return F.cross_entropy(self.logits(h_2d), targets_1d, reduction="none")
+        N, _ = h_2d.shape
+        V = self.U_bf16.shape[0]
+        inv_sc = (1.0 / self.softcap) if self.softcap > 0.0 else 0.0
+        out_nll = torch.empty((N,), dtype=torch.float32, device=h_2d.device)
+        buf = torch.empty((min(N, chunk_sz), V), dtype=torch.bfloat16, device=h_2d.device)
+        lse = torch.empty((min(N, chunk_sz),), dtype=torch.float32, device=h_2d.device)
+        for s in range(0, N, chunk_sz):
+            e = min(s + chunk_sz, N)
+            nr = e - s
+            hf = h_2d[s:e].float()
+            hn = (hf * torch.rsqrt(hf.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.norm_w).to(torch.bfloat16)
+            b_sl = buf[:nr]
+            l_sl = lse[:nr]
+            torch.matmul(hn, self.U_bf16.t(), out=b_sl)
+            _softcap_lse_nograd_kernel[(nr,)](
+                b_sl, b_sl.stride(0), l_sl, V=V, SOFTCAP=self.softcap, INV_SOFTCAP=inv_sc, BLOCK_V=4096, num_warps=8
+            )
+            raw_t = b_sl.gather(1, targets_1d[s:e].unsqueeze(1)).squeeze(1).float()
+            lg_t = (self.softcap * torch.tanh(raw_t * inv_sc)) if self.softcap > 0.0 else raw_t
+            out_nll[s:e] = l_sl - lg_t
+        return out_nll
+
+    @torch.no_grad()
+    def fast_nograd_selected_logprobs(self, h_2d: Tensor, sel_ids_2d: Tensor, chunk_sz: int = 8192) -> Tensor:
+        """Returns exact `log_probs(h_2d).gather(-1, sel_ids_2d)` `[N, k]` without materializing `[N, V]` FP32 log_softmax!"""
+        if not h_2d.is_cuda or self.U_bf16.shape[0] < 1024:
+            return self.log_probs(h_2d).gather(-1, sel_ids_2d)
+        N, _ = h_2d.shape
+        k = sel_ids_2d.shape[1]
+        V = self.U_bf16.shape[0]
+        inv_sc = (1.0 / self.softcap) if self.softcap > 0.0 else 0.0
+        out_lq = torch.empty((N, k), dtype=torch.float32, device=h_2d.device)
+        buf = torch.empty((min(N, chunk_sz), V), dtype=torch.bfloat16, device=h_2d.device)
+        lse = torch.empty((min(N, chunk_sz),), dtype=torch.float32, device=h_2d.device)
+        for s in range(0, N, chunk_sz):
+            e = min(s + chunk_sz, N)
+            nr = e - s
+            hf = h_2d[s:e].float()
+            hn = (hf * torch.rsqrt(hf.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.norm_w).to(torch.bfloat16)
+            b_sl = buf[:nr]
+            l_sl = lse[:nr]
+            torch.matmul(hn, self.U_bf16.t(), out=b_sl)
+            _softcap_lse_nograd_kernel[(nr,)](
+                b_sl, b_sl.stride(0), l_sl, V=V, SOFTCAP=self.softcap, INV_SOFTCAP=inv_sc, BLOCK_V=4096, num_warps=8
+            )
+            raw_k = b_sl.gather(1, sel_ids_2d[s:e]).float()
+            lg_k = (self.softcap * torch.tanh(raw_k * inv_sc)) if self.softcap > 0.0 else raw_k
+            out_lq[s:e] = lg_k - l_sl.unsqueeze(1)
+        return out_lq
 
 
 class WorkspaceJLens(nn.Module):
@@ -128,21 +234,28 @@ def select_diverse_fast(
     sim_norms = u_sim.norm(dim=-1)                              # [B, M]
     cos_mat   = torch.matmul(u_sim, u_sim.transpose(-1, -2)).abs()  # [B, M, M]
 
-    accepted = torch.zeros((B, M_pool), dtype=torch.bool, device=logq.device)
-    n_acc    = torch.zeros((B,), dtype=torch.long, device=logq.device)
-
-    for j in range(M_pool):
-        ok_len = sim_norms[:, j] > 0.5
-        if j == 0:
-            conflict = torch.zeros((B,), dtype=torch.bool, device=logq.device)
-        else:
-            prev_acc = accepted[:, :j]                          # [B, j]
-            c_prev   = cos_mat[:, j, :j]                        # [B, j]
-            conflict = (c_prev > max_cosine) & prev_acc
-            conflict = conflict.any(dim=-1)
-        take = ok_len & (~conflict) & (n_acc < k)
-        accepted[:, j] = take
-        n_acc = n_acc + take.long()
+    if logq.is_cuda and M_pool <= 64:
+        acc_i8 = torch.empty((B, M_pool), dtype=torch.int8, device=logq.device)
+        _greedy_diverse_accept_kernel[(B,)](
+            sim_norms.contiguous(), cos_mat.contiguous(), acc_i8,
+            M_pool, k, float(max_cosine), BLOCK_M=64, num_warps=2,
+        )
+        accepted = acc_i8.bool()
+    else:
+        accepted = torch.zeros((B, M_pool), dtype=torch.bool, device=logq.device)
+        n_acc    = torch.zeros((B,), dtype=torch.long, device=logq.device)
+        for j in range(M_pool):
+            ok_len = sim_norms[:, j] > 0.5
+            if j == 0:
+                conflict = torch.zeros((B,), dtype=torch.bool, device=logq.device)
+            else:
+                prev_acc = accepted[:, :j]
+                c_prev   = cos_mat[:, j, :j]
+                conflict = (c_prev > max_cosine) & prev_acc
+                conflict = conflict.any(dim=-1)
+            take = ok_len & (~conflict) & (n_acc < k)
+            accepted[:, j] = take
+            n_acc = n_acc + take.long()
 
     # Pack up to `k` accepted entries per batch row in original score order:
     slot_idx = torch.cumsum(accepted.long(), dim=-1) - 1        # [B, M]
@@ -229,6 +342,36 @@ def suppress_oblique_single_and_joint(
     return probes, usable_k, usable_all
 
 
+def compute_feature_loss_pregathered(
+    lq_sel: Tensor,
+    weights: Tensor,
+    valid: Tensor,
+    loss_kind: str = "superpos_unlikelihood",
+) -> Tensor:
+    w = torch.where(valid, weights.detach().float(), torch.zeros_like(weights, dtype=torch.float32))
+    lq_f = lq_sel.float()
+
+    if loss_kind == "signed_raw":
+        return -(w * lq_f).sum(dim=-1)
+
+    w_pos = F.relu(w)
+    w_neg = F.relu(-w)
+    q_sel = lq_f.exp().clamp(0.0, 1.0 - 1e-7)
+    neg_term = -(w_neg * torch.log1p(-q_sel)).sum(dim=-1)
+
+    if loss_kind == "unlikelihood":
+        pos_term = -(w_pos * lq_f).sum(dim=-1)
+        return pos_term + neg_term
+
+    pos_mask = (w > 0.0) & valid
+    sum_q_pos = (q_sel * pos_mask.float()).sum(dim=-1, keepdim=True)
+    q_bg = (1.0 - sum_q_pos).clamp_min(1e-6)
+    log_q_bg  = torch.log(q_bg)
+    log_p_ind = lq_f - torch.logaddexp(lq_f, log_q_bg.expand_as(lq_f))
+    pos_term  = -(w_pos * log_p_ind).sum(dim=-1)
+    return pos_term + neg_term
+
+
 def compute_feature_loss(
     logq: Tensor,
     ids: Tensor,
@@ -236,42 +379,8 @@ def compute_feature_loss(
     valid: Tensor,
     loss_kind: str = "superpos_unlikelihood",
 ) -> Tensor:
-    """
-    Returns one score per example `[B]` (differentiable w.r.t. `logq`, `weights` detached):
-      - `superpos_unlikelihood`:
-          * `u_j > 0`: `-u_j * log(q_j / (q_j + q_bg))` where `q_bg = max(1 - sum_{m: u_m>0} q_m, 1e-6)`
-                       (eliminates sibling competition among co-active workspace features!)
-          * `u_j < 0`: `-|u_j| * log(1 - q_j)` (bounded >= 0, vanishing gradient at `q_j -> 0`!)
-      - `unlikelihood`:
-          * `u_j > 0`: `-u_j * log q_j`
-          * `u_j < 0`: `-|u_j| * log(1 - q_j)`
-      - `signed_raw`:
-          * literal `-sum_j u_j * log q_j` (reference implementation baseline)
-    """
-    w = torch.where(valid, weights.detach().float(), torch.zeros_like(weights, dtype=torch.float32))
-    lq_sel = logq.float().gather(-1, ids)                       # [B, k]
-
-    if loss_kind == "signed_raw":
-        return -(w * lq_sel).sum(dim=-1)
-
-    w_pos = F.relu(w)
-    w_neg = F.relu(-w)
-    q_sel = lq_sel.exp().clamp(0.0, 1.0 - 1e-7)
-    neg_term = -(w_neg * torch.log1p(-q_sel)).sum(dim=-1)
-
-    if loss_kind == "unlikelihood":
-        pos_term = -(w_pos * lq_sel).sum(dim=-1)
-        return pos_term + neg_term
-
-    # `superpos_unlikelihood` (default): remove sibling positive features from denominator
-    pos_mask = (w > 0.0) & valid
-    sum_q_pos = (q_sel * pos_mask.float()).sum(dim=-1, keepdim=True)
-    q_bg = (1.0 - sum_q_pos).clamp_min(1e-6)
-    # log(q_j / (q_j + q_bg)) = lq_sel - logaddexp(lq_sel, log(q_bg))
-    log_q_bg   = torch.log(q_bg)
-    log_p_ind  = lq_sel - torch.logaddexp(lq_sel, log_q_bg.expand_as(lq_sel))
-    pos_term   = -(w_pos * log_p_ind).sum(dim=-1)
-    return pos_term + neg_term
+    lq_sel = logq.float().gather(-1, ids)
+    return compute_feature_loss_pregathered(lq_sel, weights, valid, loss_kind=loss_kind)
 
 
 @torch.no_grad()
@@ -334,13 +443,13 @@ def advance_local_window_kv(
         k_w = apply_rope(blk.k_norm(qkv[:, :, :, 1]).transpose(2, 3), cos_Sq, sin_Sq)  # [B_p, P, H, W, Dh]
         v_w = qkv[:, :, :, 2].transpose(2, 3)                                          # [B_p, P, H, W, Dh]
 
-        # Shared prefix Q @ K_clean^T without replicating K_clean across P:
+        # Shared prefix Q @ K_clean^T without replicating K_clean across P (BF16 MFMA -> FP32 softmax):
         q_pw = q_w.permute(0, 2, 1, 3, 4).reshape(B_p, H, P * W, Dh)
-        sc_pre = torch.matmul(q_pw.float(), k_clean.float().transpose(-1, -2)) * inv_sqrt_dh
+        sc_pre = torch.matmul(q_pw.to(x.dtype), k_clean.to(x.dtype).transpose(-1, -2)).float() * inv_sqrt_dh
         sc_pre = sc_pre.masked_fill(~pre_valid[:, None, None, :], -float("inf"))
         sc_pre = sc_pre.view(B_p, H, P, W, T).permute(0, 2, 1, 3, 4)                   # [B_p, P, H, W, T]
 
-        sc_loc = torch.matmul(q_w.float(), k_w.float().transpose(-1, -2)) * inv_sqrt_dh
+        sc_loc = torch.matmul(q_w.to(x.dtype), k_w.to(x.dtype).transpose(-1, -2)).float() * inv_sqrt_dh
         sc_loc = sc_loc.masked_fill(~loc_causal[None, None, None, :, :], -float("inf"))
 
         probs_all = torch.softmax(torch.cat([sc_pre, sc_loc], dim=-1), dim=-1).to(x.dtype)
@@ -591,15 +700,11 @@ class CausalAblationJLensController:
             kv_anc = extract_clean_kv_for_blocks(anc_blocks, anc_inputs, b_sel, raw_model.cos, raw_model.sin)
             fin_win = advance_local_window_kv(anc_blocks, kv_anc, h_win_a, pos, raw_model.cos, raw_model.sin)  # [B_p, P, W, D]
 
-            # Gold softcapped NLL across `[p .. p + W - 1]` in Infinity-Cache-friendly chunks:
+            # Gold softcapped NLL across `[p .. p + W - 1]` via BF16-MFMA + Triton online LSE:
             y_win = yb[b_sel[:, None], win_idx]                 # [B_p, W]
             flat_fin = fin_win.reshape(-1, self.cfg.d_model)
             flat_y   = y_win[:, None, :].expand(B_p, P, W).reshape(-1)
-            nll_chunks = []
-            for cs in range(0, flat_fin.shape[0], 4096):
-                ce_c = F.cross_entropy(self.readout.logits(flat_fin[cs : cs + 4096]), flat_y[cs : cs + 4096], reduction="none")
-                nll_chunks.append(ce_c)
-            nll_pw = torch.cat(nll_chunks, dim=0).view(B_p, P, W)
+            nll_pw   = self.readout.fast_nograd_target_nll(flat_fin, flat_y).view(B_p, P, W)
             valid_y = (y_win != EOT_TOKEN).float()
             wt_y = valid_y * self.win_weights.unsqueeze(0)
             wt_y = wt_y / wt_y.sum(dim=-1, keepdim=True).clamp_min(1e-6)
@@ -648,12 +753,13 @@ class CausalAblationJLensController:
                 else:
                     u_anc_target = u_anc
 
-                lq_at_anc = self.lens_anchor.log_probs(at_anc.reshape(B_p * P, self.cfg.d_model)).view(B_p, P, -1)
+                at_anc_h  = at_anc.reshape(B_p * P, self.cfg.d_model).float() @ self.lens_anchor.J.t()
                 ids_a_exp = ids_a.unsqueeze(1).expand(B_p, P, k).reshape(B_p * P, k)
                 u_t_exp   = u_anc_target.unsqueeze(1).expand(B_p, P, k).reshape(B_p * P, k)
                 usa_exp   = usable_a.unsqueeze(1).expand(B_p, P, k).reshape(B_p * P, k)
-                scores_e  = compute_feature_loss(
-                    lq_at_anc.view(B_p * P, -1), ids_a_exp, u_t_exp, usa_exp, loss_kind=self.loss_kind
+                lq_sel_e  = self.readout.fast_nograd_selected_logprobs(at_anc_h, ids_a_exp)
+                scores_e  = compute_feature_loss_pregathered(
+                    lq_sel_e, u_t_exp, usa_exp, loss_kind=self.loss_kind
                 ).view(B_p, P)
 
                 clean_sc_e = scores_e[:, 0:1]

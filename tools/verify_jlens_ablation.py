@@ -36,7 +36,7 @@ def main():
     ids_test = torch.tensor([[0, 1]], device=device)  # "Texas"=[1,1], "Florida"=[1,-1]
     w_r, d_w, u_s = lens.candidate_vectors(ids_test, metric="cov")
     # In cov mode, orthogonal output tokens [1,1] and [1,-1] have 0 cosine in u_sim!
-    cos_tf = float((u_s[0, 0] * u_s[0, 1]).abs().item())
+    cos_tf = float((u_s[0, 0] * u_s[0, 1]).sum().abs().item())
     assert cos_tf < 1e-6, f"Expected 0 cosine for orthogonal concepts, got {cos_tf}"
 
     x_test = torch.tensor([[0.01, 1.0]], device=device)
