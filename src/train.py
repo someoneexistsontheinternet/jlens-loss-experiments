@@ -147,6 +147,8 @@ def main():
     ap.add_argument("--hier-w-2d", type=int, default=0)
     ap.add_argument("--jlens-mode", default="none", choices=["none", "wave8"])
     ap.add_argument("--jlens-weight", type=float, default=0.35)
+    ap.add_argument("--jlens-horizons", type=int, default=8)
+    ap.add_argument("--jlens-end-frac", type=float, default=1.0)
     ap.add_argument("--jlens-upd-every", type=int, default=25)
     ap.add_argument("--opt", default="muon", choices=["muon", "adamw"])
     ap.add_argument("--muon-lr", type=float, default=0.02)
@@ -201,6 +203,7 @@ def main():
             micro_tokens=args.micro_batch * args.seq_len,
             device=device,
             unigram_path=data_dir / "unigram_counts_50432.npy",
+            horizons=args.jlens_horizons,
             softcap=cfg.softcap,
         )
 
@@ -221,6 +224,8 @@ def main():
         "fp8_block_k": args.fp8_block_k,
         "jlens_mode": args.jlens_mode,
         "jlens_weight": args.jlens_weight if use_jlens else 0.0,
+        "jlens_horizons": args.jlens_horizons if use_jlens else 0,
+        "jlens_end_frac": args.jlens_end_frac if use_jlens else 1.0,
         "opt": args.opt,
         "lr": args.muon_lr if args.opt == "muon" else args.adam_lr,
         "adam_lr": args.adam_lr,
@@ -241,17 +246,28 @@ def main():
         elif step <= stable_end:
             lr_m, j_cos = 1.0, 1.0
         else:
-            j_cos = 0.5 * (1.0 + math.cos(math.pi * (step - stable_end) / max(1, args.steps - stable_end)))
-            lr_m  = 0.05 + 0.95 * j_cos
+            w_cos = 0.5 * (1.0 + math.cos(math.pi * (step - stable_end) / max(1, args.steps - stable_end)))
+            lr_m  = 0.05 + 0.95 * w_cos
+            j_cos = w_cos
 
+        if args.jlens_end_frac < 1.0:
+            j_end = int(args.steps * args.jlens_end_frac)
+            if step <= args.warmup:
+                j_cos = 1.0
+            elif step >= j_end:
+                j_cos = 0.0
+            else:
+                j_cos = 0.5 * (1.0 + math.cos(math.pi * (step - args.warmup) / max(1, j_end - args.warmup)))
+
+        active_jlens = use_jlens and (j_cos > 1e-6)
         opt.zero_grad()
         ce_sum, jl_sum = 0.0, 0.0
-        cand_ids = jlens_ctrl.sample_vocab_candidates() if use_jlens else None
+        cand_ids = jlens_ctrl.sample_vocab_candidates() if active_jlens else None
 
         for micro_i in range(grad_accum):
             xb, yb = stream.next_batch(device)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                if use_jlens:
+                if active_jlens:
                     ce_loss, tok_nll, interm, x_raw = fwd_model(xb, yb, return_interm=True)
                     if micro_i == 0 and (step == 1 or step % args.jlens_upd_every == 0):
                         jlens_ctrl.refresh_lenses([t.detach() for t in interm], x_raw, yb)
