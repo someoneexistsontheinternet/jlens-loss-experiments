@@ -18,7 +18,8 @@ FLS_BIN   = os.environ.get("FEATHERLESS_BIN", str(Path.home() / ".local/bin/feat
 def main():
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        [FLS_BIN, "volume", "sync", "vol://jlens-data/logs", str(LOGS_DIR), "--non-interactive"],
+        [FLS_BIN, "volume", "sync", "--mode", "download", "--mkdirs", "--include", "*.jsonl.gz",
+         str(LOGS_DIR), "vol://jlens-data/logs", "--non-interactive"],
         cwd=REPO_ROOT, check=False,
     )
 

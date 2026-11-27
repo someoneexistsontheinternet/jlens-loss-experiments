@@ -1,0 +1,1 @@
+{"event": "submitted", "run_id": "001-mi325x-kernel-bench-bdd437c-72193", "job_output": "Saved compressed benchmark telemetry -> /data/logs/001-mi325x-kernel-bench-bdd437c-72193_bdd437c.jsonl.gz", "commit_sha": "bdd437c3f5b770df3d732c474e788553a6e0a1e1", "script": "scripts/001_mi325x_kernel_bench.sh", "submitted_at": "2026-11-27T09:37:31Z"}

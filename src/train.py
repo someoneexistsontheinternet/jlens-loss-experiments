@@ -155,6 +155,9 @@ def main():
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--compile", type=int, default=1)
+    ap.add_argument("--compile-mode", default="default")
+    ap.add_argument("--ce-backend", default="triton", choices=["triton", "eager"])
+    ap.add_argument("--ce-chunk-sz", type=int, default=32768)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -173,10 +176,12 @@ def main():
         fp8_block_k=args.fp8_block_k,
         jlens_mode=args.jlens_mode,
         jlens_weight=args.jlens_weight,
+        ce_backend=args.ce_backend,
+        ce_chunk_sz=args.ce_chunk_sz,
     )
     raw_model = NanoGPT70M(cfg).to(device)
     n_tot, n_trunk, flops_tok = raw_model.count_params_and_flops()
-    fwd_model = torch.compile(raw_model) if args.compile else raw_model
+    fwd_model = torch.compile(raw_model, mode=args.compile_mode) if args.compile else raw_model
 
     use_jlens = (args.jlens_mode == "wave8")
     jlens_ctrl = None

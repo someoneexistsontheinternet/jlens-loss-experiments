@@ -10,6 +10,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from fp8_kernels import QuantLinear
 
@@ -28,6 +30,122 @@ class NanoGPT70MConfig:
     fp8_block_k: int    = 128
     jlens_mode: str     = "none"   # "none" | "wave8"
     jlens_weight: float = 0.35
+    ce_backend: str     = "triton" # "triton" (fused in-place row softcap CE) | "eager"
+    ce_chunk_sz: int    = 32768
+
+
+@triton.jit
+def _softcap_ce_fwd_bwd_inplace_kernel(
+    logits_ptr, stride_m, targets_ptr, nll_ptr,
+    V: tl.constexpr, SOFTCAP: tl.constexpr, INV_SOFTCAP: tl.constexpr,
+    INV_M, BLOCK_V: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    row_ptr = logits_ptr + row * stride_m
+    tgt = tl.load(targets_ptr + row)
+
+    m_i = -float("inf")
+    d_i = 0.0
+    LOG2E: tl.constexpr = 1.4426950408889634
+
+    for start_v in range(0, V, BLOCK_V):
+        offs_v = start_v + tl.arange(0, BLOCK_V)
+        mask_v = offs_v < V
+        raw = tl.load(row_ptr + offs_v, mask=mask_v, other=-float("inf")).to(tl.float32)
+        if SOFTCAP > 0.0:
+            z = tl.minimum(tl.maximum(raw * INV_SOFTCAP, -20.0), 20.0)
+            e2z = tl.math.exp2(2.0 * LOG2E * z)
+            th = (e2z - 1.0) / (e2z + 1.0)
+            lg = tl.where(mask_v, SOFTCAP * th, -float("inf"))
+        else:
+            lg = raw
+        blk_max = tl.max(lg, axis=0)
+        m_new = tl.maximum(m_i, blk_max)
+        d_i = d_i * tl.math.exp2((m_i - m_new) * LOG2E) + tl.sum(tl.math.exp2((lg - m_new) * LOG2E), axis=0)
+        m_i = m_new
+
+    lse = m_i + tl.math.log(d_i)
+    raw_t = tl.load(row_ptr + tgt).to(tl.float32)
+    if SOFTCAP > 0.0:
+        zt = tl.minimum(tl.maximum(raw_t * INV_SOFTCAP, -20.0), 20.0)
+        e2zt = tl.math.exp2(2.0 * LOG2E * zt)
+        lg_t = SOFTCAP * ((e2zt - 1.0) / (e2zt + 1.0))
+    else:
+        lg_t = raw_t
+    tl.store(nll_ptr + row, lse - lg_t)
+
+    for start_v in range(0, V, BLOCK_V):
+        offs_v = start_v + tl.arange(0, BLOCK_V)
+        mask_v = offs_v < V
+        raw = tl.load(row_ptr + offs_v, mask=mask_v, other=0.0).to(tl.float32)
+        if SOFTCAP > 0.0:
+            z = tl.minimum(tl.maximum(raw * INV_SOFTCAP, -20.0), 20.0)
+            e2z = tl.math.exp2(2.0 * LOG2E * z)
+            th = (e2z - 1.0) / (e2z + 1.0)
+            lg = SOFTCAP * th
+            ds = 1.0 - th * th
+        else:
+            lg = raw
+            ds = 1.0
+        prob = tl.math.exp2((lg - lse) * LOG2E)
+        grad = (prob - tl.where(offs_v == tgt, 1.0, 0.0)) * (ds * INV_M)
+        tl.store(row_ptr + offs_v, grad.to(tl.bfloat16), mask=mask_v)
+
+
+class FusedTritonChunkedSoftcapCEFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, h_2d: torch.Tensor, w_vocab: torch.Tensor, targets_1d: torch.Tensor, softcap: float, chunk_sz: int = 32768):
+        M, D = h_2d.shape
+        V = w_vocab.shape[0]
+        inv_m = 1.0 / float(M)
+
+        dh = torch.empty((M, D), dtype=torch.bfloat16, device=h_2d.device)
+        dw = torch.zeros_like(w_vocab, dtype=torch.float32)
+        nll_out = torch.empty((M,), dtype=torch.float32, device=h_2d.device)
+
+        w_bf = w_vocab.to(torch.bfloat16)
+        inv_sc = (1.0 / softcap) if softcap > 0.0 else 0.0
+        max_rows = min(M, chunk_sz)
+        logits_buf = torch.empty((max_rows, V), dtype=torch.bfloat16, device=h_2d.device)
+
+        for s in range(0, M, chunk_sz):
+            e = min(s + chunk_sz, M)
+            n_r = e - s
+            hc = h_2d[s:e].to(torch.bfloat16)
+            tc = targets_1d[s:e]
+            buf = logits_buf[:n_r]
+            torch.matmul(hc, w_bf.t(), out=buf)
+            _softcap_ce_fwd_bwd_inplace_kernel[(n_r,)](
+                buf, buf.stride(0), tc, nll_out[s:e],
+                V=V, SOFTCAP=float(softcap), INV_SOFTCAP=float(inv_sc),
+                INV_M=inv_m, BLOCK_V=4096, num_warps=8,
+            )
+            torch.matmul(buf, w_bf, out=dh[s:e])
+            dw.addmm_(buf.t(), hc, beta=1.0, alpha=1.0)
+
+        loss_acc = nll_out.mean()
+        ctx.h_dtype = h_2d.dtype
+        ctx.save_for_backward(dh, dw.to(w_vocab.dtype))
+        return loss_acc, nll_out
+
+    @staticmethod
+    def backward(ctx, grad_loss, _grad_nll):
+        dh, dw = ctx.saved_tensors
+        g = grad_loss.to(ctx.h_dtype)
+        return dh.to(ctx.h_dtype) * g, dw * grad_loss.to(dw.dtype), None, None, None
+
+
+class FastRMSNorm(nn.Module):
+    """FP32-accumulated RMSNorm that preserves input dtype (BF16) for FlashAttention & QuantLinear."""
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        xf = x.float()
+        normed = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (normed * self.weight).to(x.dtype)
 
 
 class ChunkedSoftcapCEFn(torch.autograd.Function):
@@ -82,6 +200,16 @@ def apply_rope(x_bhtd: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> to
     return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
 
+@torch._dynamo.disable
+def _dispatch_chunked_softcap_ce(
+    h_2d: torch.Tensor, w_vocab: torch.Tensor, targets_1d: torch.Tensor,
+    softcap: float, backend: str, chunk_sz: int,
+):
+    if backend == "triton":
+        return FusedTritonChunkedSoftcapCEFn.apply(h_2d, w_vocab, targets_1d, softcap, chunk_sz)
+    return ChunkedSoftcapCEFn.apply(h_2d, w_vocab, targets_1d, softcap, chunk_sz)
+
+
 class NanoGPTBlock(nn.Module):
     def __init__(self, cfg: NanoGPT70MConfig):
         super().__init__()
@@ -90,13 +218,13 @@ class NanoGPTBlock(nn.Module):
         res_std  = (1.0 / math.sqrt(2.0 * cfg.n_layers)) / math.sqrt(D)
         down_std = (1.0 / math.sqrt(2.0 * cfg.n_layers)) / math.sqrt(F_d)
 
-        self.attn_norm = nn.RMSNorm(D)
+        self.attn_norm = FastRMSNorm(D)
         self.wqkv      = QuantLinear(D, 3 * D, mode=cfg.linear_mode, block_k=cfg.fp8_block_k)
-        self.q_norm    = nn.RMSNorm(cfg.head_dim)
-        self.k_norm    = nn.RMSNorm(cfg.head_dim)
+        self.q_norm    = FastRMSNorm(cfg.head_dim)
+        self.k_norm    = FastRMSNorm(cfg.head_dim)
         self.wo        = QuantLinear(D, D, mode=cfg.linear_mode, block_k=cfg.fp8_block_k, std=res_std)
 
-        self.mlp_norm  = nn.RMSNorm(D)
+        self.mlp_norm  = FastRMSNorm(D)
         self.wgu       = QuantLinear(D, 2 * F_d, mode=cfg.linear_mode, block_k=cfg.fp8_block_k)
         self.wdown     = QuantLinear(F_d, D, mode=cfg.linear_mode, block_k=cfg.fp8_block_k, std=down_std)
 
@@ -121,7 +249,7 @@ class NanoGPT70M(nn.Module):
         self.cfg      = cfg
         self.tok_emb  = nn.Embedding(cfg.vocab_pad, cfg.d_model)
         self.blocks   = nn.ModuleList([NanoGPTBlock(cfg) for _ in range(cfg.n_layers)])
-        self.out_norm = nn.RMSNorm(cfg.d_model)
+        self.out_norm = FastRMSNorm(cfg.d_model)
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
 
         half = cfg.head_dim // 2
@@ -159,8 +287,9 @@ class NanoGPT70M(nn.Module):
             if self.cfg.softcap > 0.0:
                 logits = self.cfg.softcap * torch.tanh(logits.float() * (1.0 / self.cfg.softcap))
             return logits
-        loss, tok_nll = ChunkedSoftcapCEFn.apply(
-            h.reshape(-1, self.cfg.d_model), self.tok_emb.weight, targets.reshape(-1), float(self.cfg.softcap), 8192
+        loss, tok_nll = _dispatch_chunked_softcap_ce(
+            h.reshape(-1, self.cfg.d_model), self.tok_emb.weight, targets.reshape(-1),
+            float(self.cfg.softcap), self.cfg.ce_backend, int(self.cfg.ce_chunk_sz),
         )
         if return_interm:
             return loss, tok_nll.detach(), interm, x_raw.detach()
