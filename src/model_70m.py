@@ -121,7 +121,7 @@ class FusedTritonChunkedSoftcapCEFn(torch.autograd.Function):
                 INV_M=inv_m, BLOCK_V=4096, num_warps=8,
             )
             torch.matmul(buf, w_bf, out=dh[s:e])
-            dw.addmm_(buf.t(), hc, beta=1.0, alpha=1.0)
+            dw.add_(torch.matmul(buf.t(), hc).float())
 
         loss_acc = nll_out.mean()
         ctx.h_dtype = h_2d.dtype
@@ -182,7 +182,7 @@ class ChunkedSoftcapCEFn(torch.autograd.Function):
             probs.scatter_add_(1, tc.unsqueeze(1), torch.full((e - s, 1), -1.0, device=h_2d.device, dtype=torch.float32))
             dl = (probs * (ds * inv_m)).to(torch.bfloat16)
             dh[s:e] = torch.matmul(dl, w_bf).to(h_2d.dtype)
-            dw.addmm_(dl.t(), hc, beta=1.0, alpha=1.0)
+            dw.add_(torch.matmul(dl.t(), hc).float())
 
         ctx.save_for_backward(dh, dw.to(w_vocab.dtype))
         return loss_acc, nll_out
