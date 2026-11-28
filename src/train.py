@@ -158,6 +158,8 @@ def main():
     ap.add_argument("--jlens-weight", type=float, default=0.35)
     ap.add_argument("--jlens-horizons", type=int, default=8)
     ap.add_argument("--jlens-start-frac", type=float, default=0.0)
+    ap.add_argument("--jlens-start-step", type=int, default=-1, help="Exact onset step (>= 0 overrides --jlens-start-frac with 50-step ramp + flat plateau)")
+    ap.add_argument("--jlens-flat-end-frac", type=float, default=-1.0, help="Hold flat j_cos=1.0 plateau up to this step fraction before optional cosine decay to --jlens-end-frac")
     ap.add_argument("--jlens-end-frac", type=float, default=1.0)
     ap.add_argument("--jlens-every", type=int, default=1, help="Apply J-Lens every N steps (reduces FLOP/time tax)")
     ap.add_argument("--jlens-upd-every", type=int, default=25)
@@ -182,10 +184,12 @@ def main():
     ap.add_argument("--abl-match-norm", type=int, default=1)
     ap.add_argument("--abl-metric", default="cov", choices=["cov", "euclidean"])
     ap.add_argument("--abl-j-mode", default="ols_norm", choices=["ols_norm", "identity", "true_jacobian"])
+    ap.add_argument("--abl-norm-w-dir", type=int, default=0, help="Multiply readout directions U[ids] by out_norm.weight (exact logit nullspace alignment)")
     ap.add_argument("--abl-live-readout", type=int, default=0)
     ap.add_argument("--abl-reuse-clean-nll", type=int, default=0)
     ap.add_argument("--abl-jac-samples", type=int, default=16)
-    ap.add_argument("--abl-loss-kind", default="superpos_unlikelihood", choices=["superpos_unlikelihood", "unlikelihood", "signed_raw", "exp_signed_clamped"])
+    ap.add_argument("--abl-loss-kind", default="superpos_unlikelihood", choices=["superpos_unlikelihood", "unlikelihood", "signed_raw", "exp_signed_clamped", "exp_unlikelihood"])
+    ap.add_argument("--abl-reduction", default="batch_sum", choices=["batch_sum", "active_mean"], help="batch_sum: sum/(B*T); active_mean: mean over probed tokens (1/N_act)")
     ap.add_argument("--abl-exp-beta", type=float, default=0.0)
     ap.add_argument("--abl-exp-norm", type=int, default=1)
     ap.add_argument("--abl-bystander-tau", type=float, default=0.0)
@@ -288,9 +292,11 @@ def main():
             match_norm=bool(args.abl_match_norm),
             metric=args.abl_metric,
             j_mode=args.abl_j_mode,
+            norm_w_dir=bool(args.abl_norm_w_dir),
             live_readout=bool(args.abl_live_readout),
             reuse_clean_nll=bool(args.abl_reuse_clean_nll),
             loss_kind=args.abl_loss_kind,
+            reduction=args.abl_reduction,
             exp_beta=args.abl_exp_beta,
             exp_norm=bool(args.abl_exp_norm),
             bystander_tau=args.abl_bystander_tau,
@@ -349,9 +355,12 @@ def main():
             "abl_select_mode": args.abl_select_mode,
             "abl_metric": args.abl_metric,
             "abl_j_mode": args.abl_j_mode,
+            "abl_norm_w_dir": args.abl_norm_w_dir,
             "abl_live_readout": args.abl_live_readout,
             "abl_reuse_clean_nll": args.abl_reuse_clean_nll,
             "abl_loss_kind": args.abl_loss_kind,
+            "abl_reduction": args.abl_reduction,
+            "abl_pos_mode": args.abl_pos_mode,
             "abl_exp_beta": args.abl_exp_beta,
             "abl_bystander_tau": args.abl_bystander_tau,
             "abl_bystander_rel_tau": args.abl_bystander_rel_tau,
@@ -385,6 +394,8 @@ def main():
         "jlens_weight": args.jlens_weight if use_jlens else 0.0,
         "jlens_horizons": args.jlens_horizons if (args.jlens_mode == "wave8" or is_hybrid) else 0,
         "jlens_start_frac": args.jlens_start_frac if use_jlens else 0.0,
+        "jlens_start_step": args.jlens_start_step if use_jlens else -1,
+        "jlens_flat_end_frac": args.jlens_flat_end_frac if use_jlens else -1.0,
         "jlens_end_frac": args.jlens_end_frac if use_jlens else 1.0,
         "opt": args.opt,
         "lr": args.muon_lr if args.opt == "muon" else args.adam_lr,
@@ -398,8 +409,9 @@ def main():
     })
 
     stable_end = int(args.steps * 0.80)
-    j_start    = int(args.steps * args.jlens_start_frac)
+    j_start    = args.jlens_start_step if args.jlens_start_step >= 0 else int(args.steps * args.jlens_start_frac)
     j_end      = int(args.steps * args.jlens_end_frac)
+    j_flat_end = int(round(args.steps * args.jlens_flat_end_frac)) if args.jlens_flat_end_frac >= 0.0 else -1
     w8_start   = int(args.steps * args.hybrid_w8_start_frac)
     w8_end     = int(args.steps * args.hybrid_w8_end_frac)
     t_win = time.perf_counter()
@@ -421,7 +433,18 @@ def main():
             j_cos = w_cos
 
         ramp_steps = max(50, int(round(0.025 * args.steps)))
-        if args.jlens_start_frac > 0.0 or args.jlens_end_frac < 1.0:
+        if args.jlens_start_step >= 0 or args.jlens_flat_end_frac >= 0.0:
+            j_ramp = 50 if args.jlens_start_step >= 0 else ramp_steps
+            flat_end = j_flat_end if j_flat_end >= 0 else j_end
+            if step < j_start or (step >= j_end and flat_end < j_end) or step > j_end:
+                j_cos = 0.0
+            elif j_start > 0 and step < j_start + j_ramp:
+                j_cos = 0.5 * (1.0 - math.cos(math.pi * (step - j_start + 1) / float(j_ramp)))
+            elif step <= flat_end:
+                j_cos = 1.0
+            else:
+                j_cos = 0.5 * (1.0 + math.cos(math.pi * (step - flat_end) / max(1, j_end - flat_end)))
+        elif args.jlens_start_frac > 0.0 or args.jlens_end_frac < 1.0:
             eff_start = max(args.warmup if args.jlens_start_frac == 0.0 else j_start, 0)
             if step < j_start or step >= j_end:
                 j_cos = 0.0
@@ -499,12 +522,14 @@ def main():
                             abl_stats_last["n_seqs"],
                             abl_stats_last["l_ear"],
                             abl_stats_last["l_anc"],
+                            did_refresh=did_abl_ref,
                         )
                     elif prewarm_snap and micro_i == 0:
                         if interm_det is None:
                             interm_det = [t.detach() for t in interm]
                         jlens_ctrl.refresh_snapshot(raw_model, interm_det, x_raw, yb=yb)
                         last_jlens_upd_step = step
+                        extra_jlens_flops_tot += jlens_ctrl.estimate_refresh_flops(args.micro_batch)
                 elif active_jlens and args.jlens_mode == "wave8":
                     ce_loss, tok_nll, interm, x_raw = fwd_model(xb, yb, return_interm=True)
                     did_w8_ref = (micro_i == 0) and (step == 1 or (step - last_jlens_upd_step) >= args.jlens_upd_every)
@@ -539,6 +564,7 @@ def main():
                     ce_loss, _, interm, x_raw = fwd_model(xb, yb, return_interm=True)
                     jlens_ctrl.refresh_snapshot(raw_model, [t.detach() for t in interm], x_raw, yb=yb)
                     last_jlens_upd_step = step
+                    extra_jlens_flops_tot += jlens_ctrl.estimate_refresh_flops(args.micro_batch)
                     tot_loss = ce_loss
                 else:
                     ce_loss, _ = fwd_model(xb, yb, return_interm=False)

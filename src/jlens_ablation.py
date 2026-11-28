@@ -31,7 +31,7 @@ from fast_kernels import (
     _softcap_target_nll_2half_reg_kernel,
     extract_clean_kv_fast,
 )
-from ultra_probe_kernels import advance_local_window_kv_ultra
+from ultra_probe_kernels import advance_local_window_kv_ultra, _softcap_selected_bwd_2half_kernel
 
 RHO_HARMONIC = 3.0 / math.sqrt(5.0 * math.pi)  # 0.75694...
 EOT_TOKEN    = 50256
@@ -189,7 +189,8 @@ def _flash_prefix_kv_kernel(
 class _SelectedSoftcapLinearLogProbsFn(torch.autograd.Function):
     """
     Zero-HBM-spill differentiable `log_softmax(softcap * tanh((hn @ U.T) / softcap)).gather(-1, ids)` `[N, k]`.
-    Saves only `hn` [N, D] + `lse` [N] (80 MB at N=40,000 instead of 48 GB!), running BF16 MFMA GEMMs in chunks.
+    Saves only `hn` [N, D] in BF16 + `lse` [N] in FP32, running BF16 MFMA GEMMs in chunks with exact FP32
+    selected-slot gradient subtraction (preventing BF16 catastrophic cancellation at high `p >= 0.99`).
     """
     @staticmethod
     def forward(ctx, hn_fp32: Tensor, U_bf16: Tensor, ids: Tensor, softcap: float, chunk_sz: int = 4096) -> Tensor:
@@ -199,6 +200,7 @@ class _SelectedSoftcapLinearLogProbsFn(torch.autograd.Function):
         inv_sc = (1.0 / softcap) if softcap > 0.0 else 0.0
         use_2half = (32768 < V <= 65536)
 
+        hn_bf_all = hn_fp32.detach().to(torch.bfloat16)
         lq_sel = torch.empty((N, k), dtype=torch.float32, device=hn_fp32.device)
         lse_all = torch.empty((N,), dtype=torch.float32, device=hn_fp32.device)
         buf = torch.empty((min(N, chunk_sz), V), dtype=torch.bfloat16, device=hn_fp32.device)
@@ -206,7 +208,7 @@ class _SelectedSoftcapLinearLogProbsFn(torch.autograd.Function):
         for s in range(0, N, chunk_sz):
             e = min(s + chunk_sz, N)
             nr = e - s
-            hn_bf = hn_fp32[s:e].detach().to(torch.bfloat16)
+            hn_bf = hn_bf_all[s:e]
             b_sl = buf[:nr]
             l_sl = lse_all[s:e]
             torch.matmul(hn_bf, U_bf16.t(), out=b_sl)
@@ -219,51 +221,69 @@ class _SelectedSoftcapLinearLogProbsFn(torch.autograd.Function):
                     b_sl, b_sl.stride(0), l_sl, V=V, SOFTCAP=float(softcap), INV_SOFTCAP=float(inv_sc), BLOCK_V=4096, num_warps=8
                 )
             raw_k = b_sl.gather(1, ids[s:e]).float()
-            lg_k = (softcap * torch.tanh(raw_k * inv_sc)) if softcap > 0.0 else raw_k
+            lg_k = (softcap * torch.tanh((raw_k * inv_sc).clamp(-20.0, 20.0))) if softcap > 0.0 else raw_k
             lq_sel[s:e] = lg_k - l_sl.unsqueeze(1)
 
-        ctx.save_for_backward(hn_fp32.detach(), U_bf16, ids, lse_all)
+        ctx.save_for_backward(hn_bf_all, U_bf16, ids, lse_all)
+        ctx.hn_dtype = hn_fp32.dtype
         ctx.softcap = float(softcap)
         ctx.chunk_sz = int(chunk_sz)
         return lq_sel
 
     @staticmethod
     def backward(ctx, grad_lq: Tensor):
-        hn_saved, U_bf16, ids, lse_all = ctx.saved_tensors
+        hn_bf_saved, U_bf16, ids, lse_all = ctx.saved_tensors
         softcap = ctx.softcap
         chunk_sz = ctx.chunk_sz
         inv_sc = (1.0 / softcap) if softcap > 0.0 else 0.0
 
-        N, D = hn_saved.shape
+        N, D = hn_bf_saved.shape
         V = U_bf16.shape[0]
-        dhn_bf = torch.empty((N, D), dtype=torch.bfloat16, device=hn_saved.device)
-        buf = torch.empty((min(N, chunk_sz), V), dtype=torch.bfloat16, device=hn_saved.device)
+        use_2half = (32768 < V <= 65536)
+        dhn_bf = torch.empty((N, D), dtype=torch.bfloat16, device=hn_bf_saved.device)
+        buf = torch.empty((min(N, chunk_sz), V), dtype=torch.bfloat16, device=hn_bf_saved.device)
 
         for s in range(0, N, chunk_sz):
             e = min(s + chunk_sz, N)
             nr = e - s
-            hn_bf = hn_saved[s:e].to(torch.bfloat16)
+            hn_bf = hn_bf_saved[s:e]
             b_sl = buf[:nr]
+            l_sl = lse_all[s:e]
             torch.matmul(hn_bf, U_bf16.t(), out=b_sl)
 
             ids_sl = ids[s:e]
             raw_k = b_sl.gather(1, ids_sl).float()
             if softcap > 0.0:
-                th_k = torch.tanh(raw_k * inv_sc)
+                th_k = torch.tanh((raw_k * inv_sc).clamp(-20.0, 20.0))
+                lg_k = softcap * th_k
                 ds_k = 1.0 - th_k * th_k
             else:
+                lg_k = raw_k
                 ds_k = torch.ones_like(raw_k)
 
             g_k = grad_lq[s:e].float()
             sum_g = g_k.sum(dim=-1).contiguous()
-            _softcap_selected_base_bwd_kernel[(nr,)](
-                b_sl, b_sl.stride(0), lse_all[s:e], sum_g,
-                V=V, SOFTCAP=softcap, INV_SOFTCAP=inv_sc, BLOCK_V=4096, num_warps=8,
-            )
-            b_sl.scatter_add_(1, ids_sl, (g_k * ds_k).to(torch.bfloat16))
+            prob_k = torch.exp(lg_k - l_sl.unsqueeze(1))
+            # Duplicate-safe FP32 sum of g_k at each selected vocab ID, followed by exact FP32 subtraction:
+            eq_ids = (ids_sl.unsqueeze(2) == ids_sl.unsqueeze(1)).to(g_k.dtype)
+            g_sum_k = torch.bmm(eq_ids, g_k.unsqueeze(2)).squeeze(2)
+            sel_grad_fp32 = (g_sum_k - sum_g.unsqueeze(1) * prob_k) * ds_k
+
+            if use_2half:
+                _softcap_selected_bwd_2half_kernel[(nr,)](
+                    b_sl, b_sl.stride(0), l_sl, sum_g,
+                    V=V, SOFTCAP=softcap, INV_SOFTCAP=inv_sc, HALF_V=32768, num_warps=8,
+                )
+            else:
+                _softcap_selected_base_bwd_kernel[(nr,)](
+                    b_sl, b_sl.stride(0), l_sl, sum_g,
+                    V=V, SOFTCAP=softcap, INV_SOFTCAP=inv_sc, BLOCK_V=4096, num_warps=8,
+                )
+            # Overwrite selected slots with exact FP32-subtracted BF16 gradients (identical across any duplicate IDs):
+            b_sl.scatter_(1, ids_sl, sel_grad_fp32.to(torch.bfloat16))
             torch.matmul(b_sl, U_bf16, out=dhn_bf[s:e])
 
-        return dhn_bf.to(hn_saved.dtype), None, None, None, None
+        return dhn_bf.to(ctx.hn_dtype), None, None, None, None
 
 
 # ==============================================================================
@@ -467,12 +487,14 @@ class WorkspaceJLens(nn.Module):
         device: torch.device,
         norm_input: bool = True,
         is_identity: bool = False,
+        norm_w_dir: bool = False,
     ):
         super().__init__()
         self.d_model     = d_model
         self.readout     = readout
         self.norm_input  = bool(norm_input)
         self.is_identity = bool(is_identity)
+        self.norm_w_dir  = bool(norm_w_dir)
         self.register_buffer("J", torch.eye(d_model, dtype=torch.float32, device=device))
         self.register_buffer("Sigma", torch.eye(d_model, dtype=torch.float32, device=device))
 
@@ -505,7 +527,9 @@ class WorkspaceJLens(nn.Module):
     def candidate_vectors(self, ids: Tensor, metric: str = "cov") -> tuple[Tensor, Tensor, Tensor]:
         with torch.amp.autocast(device_type=ids.device.type, enabled=False):
             u_tok  = self.readout.U[ids]
-            w_read = torch.matmul(u_tok, self.J)
+            if self.norm_w_dir:
+                u_tok = u_tok * self.readout.norm_w
+            w_read = u_tok if self.is_identity else torch.matmul(u_tok, self.J)
             if metric == "cov":
                 d_write = torch.matmul(w_read, self.Sigma)
                 denom = (w_read * d_write).sum(dim=-1, keepdim=True).clamp_min(1e-16).sqrt()
@@ -514,8 +538,8 @@ class WorkspaceJLens(nn.Module):
                 u_sim  = torch.where(denom > 1e-8, u_sim, torch.zeros_like(u_sim))
             else:
                 d_write = w_read
-                w_norm  = w_read.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-                u_sim   = torch.where(w_read.norm(dim=-1, keepdim=True) > 1e-8, w_read / w_norm, torch.zeros_like(w_read))
+                w_len   = w_read.norm(dim=-1, keepdim=True)
+                u_sim   = torch.where(w_len > 1e-8, w_read / w_len.clamp_min(1e-8), torch.zeros_like(w_read))
             return w_read, d_write, u_sim
 
 
@@ -820,14 +844,26 @@ def compute_effective_feature_weights(
     bystander_tau: float = 0.0,
     bystander_w: float = 0.0,
     bystander_unscaled: bool = False,
+    u_clamp: float = 0.6,
+    shift_neg_by_bys: bool = True,
 ) -> Tensor:
-    u_c   = torch.where(valid, weights.detach().float().clamp(-0.6, 0.6), torch.zeros_like(weights, dtype=torch.float32))
+    u_lim = float(u_clamp)
+    u_c   = torch.where(valid, weights.detach().float().clamp(-u_lim, u_lim), torch.zeros_like(weights, dtype=torch.float32))
     tau   = max(0.0, float(bystander_tau))
     w_bys = max(0.0, float(bystander_w))
 
+    # C^1-smooth exponential gain with linear continuation past z_max=3.6 (exact knee at u=0.6 for beta=6.0):
+    # strictly monotonic up to u_clamp=5.0 without e^30 winner-take-all batch collapse under exp_norm=True!
+    def _exp_gain(u_abs_in: Tensor) -> Tensor:
+        if exp_beta <= 0.0:
+            return u_abs_in
+        z = exp_beta * u_abs_in
+        z_c = z.clamp_max(3.6)
+        return (torch.expm1(z_c) + math.exp(3.6) * (z - z_c)) * (1.0 / exp_beta)
+
     if tau > 0.0 or w_bys > 0.0:
         u_abs  = u_c.abs()
-        phi    = (torch.expm1(exp_beta * u_abs) * (1.0 / exp_beta)) if exp_beta > 0.0 else u_abs
+        phi    = _exp_gain(u_abs)
         is_pos = valid & (u_c >= tau) & (u_c > 0.0)
         is_neg = valid & (u_c <= -tau) & (u_c < 0.0)
         is_bys = valid & (~is_pos) & (~is_neg)
@@ -842,22 +878,25 @@ def compute_effective_feature_weights(
                 phi_eff = torch.where(mean_ap > 1e-8, phi * (mean_au / mean_ap.clamp_min(1e-8)), phi)
             else:
                 phi_eff = phi
+            neg_eff = (phi_eff + w_bys) if shift_neg_by_bys else phi_eff
             return torch.where(
                 is_pos,
                 phi_eff,
-                torch.where(is_neg, -(phi_eff + w_bys), torch.where(is_bys, torch.full_like(u_c, -w_bys), torch.zeros_like(u_c))),
+                torch.where(is_neg, -neg_eff, torch.where(is_bys, torch.full_like(u_c, -w_bys), torch.zeros_like(u_c))),
             )
 
+        neg_raw = (phi + w_bys) if shift_neg_by_bys else phi
         u_raw = torch.where(
             is_pos,
             phi,
-            torch.where(is_neg, -(phi + w_bys), torch.where(is_bys, torch.full_like(u_c, -w_bys), torch.zeros_like(u_c))),
+            torch.where(is_neg, -neg_raw, torch.where(is_bys, torch.full_like(u_c, -w_bys), torch.zeros_like(u_c))),
         )
         if exp_norm:
+            nat_neg = (u_abs + w_bys) if shift_neg_by_bys else u_abs
             nat_ref = torch.where(
                 is_pos,
                 u_abs,
-                torch.where(is_neg, u_abs + w_bys, torch.where(is_bys, torch.full_like(u_c, w_bys), torch.zeros_like(u_c))),
+                torch.where(is_neg, nat_neg, torch.where(is_bys, torch.full_like(u_c, w_bys), torch.zeros_like(u_c))),
             )
             n_val  = valid.float().sum().clamp_min(1.0)
             mean_t = nat_ref.sum() / n_val
@@ -866,7 +905,7 @@ def compute_effective_feature_weights(
         return u_raw
 
     if exp_beta > 0.0:
-        u_raw = torch.sign(u_c) * (torch.expm1(exp_beta * u_c.abs()) * (1.0 / exp_beta))
+        u_raw = torch.sign(u_c) * _exp_gain(u_c.abs())
         u_raw = torch.where(valid, u_raw, torch.zeros_like(u_raw))
         if exp_norm:
             n_val  = valid.float().sum().clamp_min(1.0)
@@ -895,6 +934,25 @@ def compute_feature_loss_pregathered(
 
         if loss_kind == "signed_raw":
             return -(w * lq_f).sum(dim=-1)
+
+        if loss_kind == "exp_unlikelihood":
+            u_tilde = compute_effective_feature_weights(
+                w, valid, exp_beta=exp_beta, exp_norm=exp_norm,
+                bystander_tau=bystander_tau, bystander_w=bystander_w,
+                bystander_unscaled=bystander_unscaled, u_clamp=5.0, shift_neg_by_bys=False,
+            )
+            w_pos = F.relu(u_tilde)
+            w_neg = F.relu(-u_tilde)
+            q_sel = lq_f.exp().clamp(0.0, 1.0 - 1e-7)
+            pos_mask = (u_tilde > 0.0) & valid
+            sum_q_pos = (q_sel * pos_mask.float()).sum(dim=-1, keepdim=True)
+            q_bg = (1.0 - sum_q_pos).clamp_min(1e-6)
+            log_q_bg  = torch.log(q_bg)
+            log_p_ind = lq_f - torch.logaddexp(lq_f, log_q_bg.expand_as(lq_f))
+            pos_term  = -(w_pos * log_p_ind).sum(dim=-1)
+            # Bounded probability-proportional unlikelihood: 0% gradient sign inversion, loss >= 0!
+            neg_term  = -(w_neg * torch.log1p(-q_sel)).sum(dim=-1)
+            return pos_term + neg_term
 
         if loss_kind == "exp_signed_clamped":
             u_tilde = compute_effective_feature_weights(
@@ -1135,10 +1193,10 @@ def _compute_exact_prefix_jacobians(
             blk = raw_model.blocks[m]
             xb  = interm_det[m - 1][uniq_b].detach().float()
             an  = pure_rms_norm_fp32(xb, blk.attn_norm.eps) * blk.attn_norm.weight.detach().float()
-            qkv = F.linear(an, blk.wqkv.weight.detach().float()).view(B_u, T, 3, H, Dh)
-            kn  = pure_rms_norm_fp32(qkv[:, :, 1], blk.k_norm.eps) * blk.k_norm.weight.detach().float()
+            kv  = F.linear(an, blk.wqkv.weight[D:].detach().float()).view(B_u, T, 2, H, Dh)
+            kn  = pure_rms_norm_fp32(kv[:, :, 0], blk.k_norm.eps) * blk.k_norm.weight.detach().float()
             kc  = apply_rope(kn.transpose(1, 2), cos_t, sin_t)[inv_b].contiguous()
-            vc  = qkv[:, :, 2].transpose(1, 2)[inv_b].contiguous()
+            vc  = kv[:, :, 1].transpose(1, 2)[inv_b].contiguous()
             kv_clean.append((kc, vc))
 
         t_ar      = torch.arange(T, device=dev)[None, :]
@@ -1206,9 +1264,11 @@ class CausalAblationJLensController:
         match_norm: bool = True,
         metric: str = "cov",
         j_mode: str = "ols_norm",
+        norm_w_dir: bool = False,
         live_readout: bool = False,
         reuse_clean_nll: bool = False,
         loss_kind: str = "superpos_unlikelihood",
+        reduction: str = "batch_sum",
         exp_beta: float = 0.0,
         exp_norm: bool = True,
         bystander_tau: float = 0.0,
@@ -1239,6 +1299,7 @@ class CausalAblationJLensController:
         assert layer_mode in ("fixed", "random_gap4", "random_anc_7_10", "random_3_11", "split_6_9", "split_3_11")
         assert select_mode in ("greedy_cos", "maxmin", "kmeans", "emeans")
         assert j_mode in ("ols_norm", "identity", "true_jacobian")
+        assert reduction in ("batch_sum", "active_mean")
         self.cfg                = raw_model.cfg
         self.device             = device
         self.early_layer        = early_layer
@@ -1255,9 +1316,11 @@ class CausalAblationJLensController:
         self.match_norm         = match_norm
         self.metric             = metric
         self.j_mode             = j_mode
+        self.norm_w_dir         = bool(norm_w_dir)
         self.live_readout       = bool(live_readout)
         self.reuse_clean_nll    = bool(reuse_clean_nll)
         self.loss_kind          = loss_kind
+        self.reduction          = reduction
         self.exp_beta           = float(exp_beta)
         self.exp_norm           = bool(exp_norm)
         self.bystander_tau      = float(bystander_tau)
@@ -1282,6 +1345,7 @@ class CausalAblationJLensController:
         self.ema                = ema
         self.pos_chunk_sz       = pos_chunk_sz
         self._initialized       = (j_mode == "identity" and self.shared_w8_weight <= 0.0)
+        self._n_refreshes       = 0
         self.pair_rng           = torch.Generator(device="cpu")
         self.pair_rng.manual_seed(int(seed) + 1009)
 
@@ -1301,46 +1365,61 @@ class CausalAblationJLensController:
                     (le, la) for le in range(1, self.cfg.n_layers - 1)
                     for la in range(2, self.cfg.n_layers) if (la - le) >= mg
                 ]
-            tracked_layers = sorted({l for pr in self.valid_layer_pairs for l in pr} | {early_layer, anchor_layer})
+            tracked_layers = sorted(
+                ({l for pr in self.valid_layer_pairs for l in pr} | {early_layer, anchor_layer})
+                if enable_early else {la for _, la in self.valid_layer_pairs}
+            )
         elif layer_mode == "random_anc_7_10":
             if self.cfg.n_layers >= 12:
                 anc_list = [7, 8, 9, 10]
             else:
                 anc_list = list(range(max(2, early_layer + 1), self.cfg.n_layers))
             self.valid_layer_pairs = [(early_layer, la) for la in anc_list]
-            tracked_layers = sorted(set(anc_list) | {early_layer, anchor_layer})
+            tracked_layers = sorted((set(anc_list) | {early_layer, anchor_layer}) if enable_early else set(anc_list))
         elif layer_mode == "random_3_11":
             min_past_2 = min(3, max(1, self.cfg.n_layers - 1))
             anc_list = list(range(min_past_2, self.cfg.n_layers))
             self.valid_layer_pairs = [(min(early_layer, max(1, la - 1)), la) for la in anc_list]
-            tracked_layers = sorted(set(anc_list) | {early_layer, anchor_layer})
+            tracked_layers = sorted((set(anc_list) | {early_layer, anchor_layer}) if enable_early else set(anc_list))
         elif layer_mode == "split_6_9":
             if self.cfg.n_layers >= 12:
                 self.split_anc_layers = [6, 7, 8, 9]
             else:
                 self.split_anc_layers = list(range(max(1, self.cfg.n_layers // 2), self.cfg.n_layers))
             self.valid_layer_pairs = [(early_layer, la) for la in self.split_anc_layers]
-            tracked_layers = sorted(set(self.split_anc_layers) | {early_layer, anchor_layer})
+            tracked_layers = sorted(
+                (set(self.split_anc_layers) | {early_layer, anchor_layer})
+                if enable_early else set(self.split_anc_layers)
+            )
         elif layer_mode == "split_3_11":
             min_past_2 = min(3, max(1, self.cfg.n_layers - 1))
             self.split_anc_layers = list(range(min_past_2, self.cfg.n_layers))
             self.valid_layer_pairs = [(min(early_layer, max(1, la - 1)), la) for la in self.split_anc_layers]
-            tracked_layers = sorted(set(self.split_anc_layers) | {early_layer, anchor_layer})
+            tracked_layers = sorted(
+                (set(self.split_anc_layers) | {early_layer, anchor_layer})
+                if enable_early else set(self.split_anc_layers)
+            )
         else:
             self.valid_layer_pairs = [(early_layer, anchor_layer)]
-            tracked_layers = sorted({early_layer, anchor_layer})
+            tracked_layers = sorted({early_layer, anchor_layer}) if enable_early else [anchor_layer]
+
+        if self.shared_w8_weight > 0.0 and anchor_layer not in tracked_layers:
+            tracked_layers = sorted(set(tracked_layers) | {anchor_layer})
 
         use_norm_in = (j_mode == "ols_norm")
         is_id       = (j_mode == "identity")
         self.tracked_layers = tracked_layers
         self.lenses = nn.ModuleDict({
             str(l): WorkspaceJLens(
-                self.cfg.d_model, self.readout, device, norm_input=use_norm_in, is_identity=is_id
+                self.cfg.d_model, self.readout, device,
+                norm_input=use_norm_in, is_identity=is_id, norm_w_dir=self.norm_w_dir,
             ).to(device)
             for l in tracked_layers
         })
-        self.lens_early  = self.lenses[str(early_layer)]
-        self.lens_anchor = self.lenses[str(anchor_layer)]
+        self.lens_early  = self.lenses[str(early_layer)] if str(early_layer) in self.lenses else None
+        self.lens_anchor = (
+            self.lenses[str(anchor_layer)] if str(anchor_layer) in self.lenses else self.lenses[str(tracked_layers[-1])]
+        )
 
         w_vec = torch.tensor([RHO_HARMONIC ** m for m in range(window)], dtype=torch.float32, device=device)
         self.win_weights = w_vec / w_vec.sum()
@@ -1369,6 +1448,33 @@ class CausalAblationJLensController:
         p_anc     = self.k_dirs + (1 if inc_clean else 0) + (1 if inc_joint else 0)
         return inc_clean, inc_joint, p_anc
 
+    def estimate_refresh_flops(self, micro_batch: int) -> float:
+        """Exact FLOPs for one `refresh_snapshot` call (`true_jacobian` VJP, `ols_norm` Cholesky, `cov`, `shared_w8`)."""
+        T   = float(self.cfg.seq_len)
+        D   = float(self.cfg.d_model)
+        F_d = float(self.cfg.d_ff)
+        blk_lin_2n = 2.0 * (D * 3.0 * D + D * D + D * 2.0 * F_d + F_d * D)
+        fl = 0.0
+        if self.j_mode == "true_jacobian":
+            n_j_blk = float(self.cfg.n_layers - min(self.tracked_layers))
+            b_c = float(self.jac_samples)
+            # Single-pos fwd + batched VJP (D dgrad passes) + prefix 2*D KV + batched VJP attention 4*(1+D)*b_c*T*D:
+            fl += n_j_blk * ((1.0 + D) * b_c * blk_lin_2n + 2.0 * b_c * T * D * (2.0 * D) + 4.0 * (1.0 + D) * b_c * T * D)
+        use_sh_w8 = (self.shared_w8_weight > 0.0) and (self.cfg.seq_len > self.shared_w8_horizons)
+        if self.j_mode == "ols_norm" or use_sh_w8 or self.metric == "cov":
+            k_r   = float(min(4096, micro_batch * self.cfg.seq_len))
+            n_trk = float(len(self.tracked_layers))
+            if self.j_mode == "ols_norm" or use_sh_w8:
+                fl += n_trk * (2.0 * k_r * D * D + (D ** 3) / 3.0)
+                if self.j_mode == "ols_norm":
+                    fl += n_trk * (2.0 * k_r * D * D + 2.0 * (D ** 3))
+                if use_sh_w8:
+                    h_w = float(self.shared_w8_horizons)
+                    fl += 2.0 * k_r * h_w * D * D + 2.0 * h_w * (D ** 3)
+            if self.metric == "cov":
+                fl += n_trk * (2.0 * k_r * D * D)
+        return fl
+
     def estimate_call_flops(
         self,
         micro_batch: int,
@@ -1378,7 +1484,7 @@ class CausalAblationJLensController:
         anchor_layer: int | None = None,
         did_refresh: bool = False,
     ) -> float:
-        """Exact FLOPs per `compute_loss` call accounting for `P_anc`, `split_6_9` shared KV, and `true_jacobian` VJP."""
+        """Exact FLOPs per `compute_loss` call including 4-GEMM readout, `select_diverse_from_pool`, & refresh VJP/OLS."""
         T   = self.cfg.seq_len
         D   = self.cfg.d_model
         F_d = self.cfg.d_ff
@@ -1418,23 +1524,33 @@ class CausalAblationJLensController:
         ear_flops = n_ear_blk * (ear_tok * blk_lin_2n + 4.0 * ear_tok * (0.5 * T + 1) * D)
 
         j_mat_cost = 0.0 if self.j_mode == "identity" else (D * D)
-        ro_anc = 2.0 * (anc_tok * D * V) + 6.0 * (n_act * (j_mat_cost + D * V))
-        ro_ear = (2.0 * (ear_tok * (j_mat_cost + D * V)) + 6.0 * (n_act * (j_mat_cost + D * V))) if self.enable_early else 0.0
+        # 4 readout GEMMs per active layer: topk_pool (2NDV) + selected fwd (2NDV) + bwd recompute (2NDV) + bwd dgrad (2NDV) = 8NDV
+        ro_anc = 2.0 * (anc_tok * D * V) + 6.0 * (n_act * j_mat_cost) + 8.0 * (n_act * D * V)
+        ro_ear = (2.0 * (ear_tok * (j_mat_cost + D * V)) + 6.0 * (n_act * j_mat_cost) + 8.0 * (n_act * D * V)) if self.enable_early else 0.0
+
+        # `select_diverse_from_pool` + joint oblique Gram (previously uncounted):
+        M_p = float(min(self.pool_size, V))
+        k_f = float(self.k_dirs)
+        n_sel_layers = 2.0 if self.enable_early else 1.0
+        sel_uj   = 0.0 if self.j_mode == "identity" else (2.0 * n_act * M_p * D * D)
+        sel_sig  = (2.0 * n_act * M_p * D * D) if self.metric == "cov" else 0.0
+        sel_gram = 2.0 * n_act * M_p * M_p * D
+        sel_km   = (14.0 * n_act * M_p * M_p * k_f) if self.select_mode in ("kmeans", "emeans") else 0.0
+        jnt_gram = (2.0 * n_act * k_f * k_f * D) if inc_joint else 0.0
+        sel_fl   = n_sel_layers * (sel_uj + sel_sig + sel_gram + sel_km + jnt_gram)
+
         sh_w8 = (
             4.0 * float(n_act) * float(self.shared_w8_horizons) * D * (D + float(self.shared_w8_k_vocab) + 1.0)
             if self.shared_w8_weight > 0.0 else 0.0
         )
-        jac_fl = 0.0
-        if did_refresh and self.j_mode == "true_jacobian":
-            n_j_blk = float(self.cfg.n_layers - min(self.tracked_layers))
-            b_c = float(self.jac_samples)
-            jac_fl = n_j_blk * ((b_c + D * b_c) * blk_lin_2n + 2.0 * b_c * T * D * (2.0 * D))
-        return kv_flops + anc_flops + ear_flops + ro_anc + ro_ear + sh_w8 + jac_fl
+        ref_fl = self.estimate_refresh_flops(micro_batch) if did_refresh else 0.0
+        return kv_flops + anc_flops + ear_flops + ro_anc + ro_ear + sel_fl + sh_w8 + ref_fl
 
     @torch.no_grad()
     def refresh_snapshot(self, raw_model: nn.Module, interm_det: list[Tensor], x_raw_final: Tensor, yb: Tensor | None = None):
         with torch.amp.autocast(device_type=x_raw_final.device.type, enabled=False):
-            alpha = self.ema if self._initialized else 0.0
+            # Bias-corrected EMA warmup: exact running mean for early refreshes, transitioning smoothly to `self.ema`:
+            alpha = min(self.ema, self._n_refreshes / float(self._n_refreshes + 1)) if self._initialized else 0.0
             if self.live_readout:
                 self.readout.copy_from_(raw_model.out_norm.weight, raw_model.tok_emb.weight)
             else:
@@ -1446,6 +1562,7 @@ class CausalAblationJLensController:
 
             if self.j_mode == "identity" and not use_sh_w8 and self.metric != "cov":
                 self._initialized = True
+                self._n_refreshes += 1
                 return
 
             if use_sh_w8:
@@ -1507,6 +1624,7 @@ class CausalAblationJLensController:
                         self.lenses[str(l_idx)].Sigma.mul_(alpha).add_(sig_all[idx_l], alpha=(1.0 - alpha))
 
             self._initialized = True
+            self._n_refreshes += 1
 
     @torch.no_grad()
     def select_probe_positions(self, yb: Tensor, tok_nll_det: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -1553,14 +1671,17 @@ class CausalAblationJLensController:
                 if int(easy_elig.sum().item()) < min_easy_pool:
                     easy_elig = valid_flat & (~is_hard)
                 n_easy_elig = int(easy_elig.sum().item())
-                k_pool_easy = min(max(1, n_easy_elig), min_easy_pool)
-                nll_e = torch.where(easy_elig, nll_flat, torch.full_like(nll_flat, 1e9))
-                _, easy_pool = torch.topk(nll_e, k_pool_easy, largest=False)
+                if n_easy_elig > 0:
+                    k_pool_easy = min(n_easy_elig, min_easy_pool)
+                    nll_e = torch.where(easy_elig, nll_flat, torch.full_like(nll_flat, 1e9))
+                    _, easy_pool = torch.topk(nll_e, k_pool_easy, largest=False)
+                else:
+                    easy_pool = torch.empty((0,), dtype=torch.long, device=yb.device)
 
                 n_take_hard = min(hard_pool.numel(), int(round((2.0 / 3.0) * n_act_tot)))
-                n_take_easy = min(easy_pool.numel(), max(1, n_act_tot - n_take_hard))
-                if n_take_hard + n_take_easy < n_act_tot and hard_pool.numel() >= n_act_tot - n_take_easy:
-                    n_take_hard = n_act_tot - n_take_easy
+                n_take_easy = min(easy_pool.numel(), n_act_tot - n_take_hard)
+                if n_take_hard + n_take_easy < n_act_tot:
+                    n_take_hard = min(hard_pool.numel(), n_act_tot - n_take_easy)
 
                 sel_h = hard_pool[torch.randperm(hard_pool.numel(), device=yb.device)[:n_take_hard]]
                 sel_e = easy_pool[torch.randperm(easy_pool.numel(), device=yb.device)[:n_take_easy]]
@@ -1707,7 +1828,8 @@ class CausalAblationJLensController:
             lq_sel_anc    = lens_anc.selected_log_probs(x_anc_live, ids_a)
             gold_vec      = None
 
-        u_abs_cl = u_anc.clamp(-0.6, 0.6).abs()
+        u_cl_lim = 5.0 if self.loss_kind == "exp_unlikelihood" else 0.6
+        u_abs_cl = u_anc.clamp(-u_cl_lim, u_cl_lim).abs()
         if self.bystander_rel_tau > 0.0:
             mean_ul = float((u_abs_cl * usable_a.float()).sum().item()) / max(1.0, float(usable_a.float().sum().item()))
             tau_eff = max(self.bystander_tau, self.bystander_rel_tau * mean_ul)
@@ -1801,7 +1923,7 @@ class CausalAblationJLensController:
             usable_a       = torch.cat(usa_parts, dim=0)
             val_a          = torch.cat(val_parts, dim=0)
             bys_mask_a     = torch.cat(bys_parts, dim=0)
-            loss_anc_mean  = vec_anc.mean()
+            loss_anc_mean  = torch.stack([v.mean() for v in vec_parts]).mean()
             loss_anc_batch = vec_anc.sum() * inv_m_tot
             cur_ear, cur_anc = self.early_layer, self.anchor_layer
             ids_a = None
@@ -1884,11 +2006,19 @@ class CausalAblationJLensController:
 
                 # Compute fixed anchor target weights BEFORE `hop_norm` so bystander `tau` is evaluated in true nat units
                 # and `sc_ec` never double-exponentiates `exp_beta`!
-                if self.loss_kind == "exp_signed_clamped":
+                if self.loss_kind in ("exp_signed_clamped", "exp_unlikelihood"):
+                    is_eul = (self.loss_kind == "exp_unlikelihood")
+                    u_cl_a = 5.0 if is_eul else 0.6
+                    if self.bystander_rel_tau > 0.0:
+                        mean_ua = float((u_anc.clamp(-u_cl_a, u_cl_a).abs() * usable_a.float()).sum().item()) / max(1.0, float(usable_a.float().sum().item()))
+                        tau_anc_eff = max(self.bystander_tau, self.bystander_rel_tau * mean_ua)
+                    else:
+                        tau_anc_eff = self.bystander_tau
                     u_eff_anc = compute_effective_feature_weights(
                         u_anc, usable_a, exp_beta=self.exp_beta, exp_norm=self.exp_norm,
-                        bystander_tau=self.bystander_tau, bystander_w=self.bystander_w,
+                        bystander_tau=tau_anc_eff, bystander_w=self.bystander_w,
                         bystander_unscaled=self.bystander_unscaled,
+                        u_clamp=u_cl_a, shift_neg_by_bys=(not is_eul),
                     )
                 else:
                     u_eff_anc = u_anc
@@ -1934,17 +2064,28 @@ class CausalAblationJLensController:
                 u_ear_abs = float(u_ear.abs().mean().item())
                 del kv_ear
 
+            u_cl_e = 5.0 if self.loss_kind == "exp_unlikelihood" else 0.6
+            if self.bystander_rel_tau > 0.0:
+                mean_ue = float((u_ear.clamp(-u_cl_e, u_cl_e).abs() * usable_e.float()).sum().item()) / max(1.0, float(usable_e.float().sum().item()))
+                tau_ear_eff = max(self.bystander_tau, self.bystander_rel_tau * mean_ue)
+            else:
+                tau_ear_eff = self.bystander_tau
+
             lq_sel_ear     = lens_ear.selected_log_probs(x_ear_live, ids_e)
             vec_ear        = compute_feature_loss_pregathered(
                 lq_sel_ear, u_ear, usable_e, loss_kind=self.loss_kind, exp_beta=self.exp_beta,
-                exp_norm=self.exp_norm, bystander_tau=self.bystander_tau, bystander_w=self.bystander_w,
+                exp_norm=self.exp_norm, bystander_tau=tau_ear_eff, bystander_w=self.bystander_w,
                 bystander_unscaled=self.bystander_unscaled,
             )
             loss_ear_mean  = vec_ear.mean()
             loss_ear_batch = vec_ear.sum() * inv_m_tot
 
-        tot_aux  = 0.5 * (loss_anc_batch + loss_ear_batch) if self.enable_early else loss_anc_batch
-        tot_obs  = (0.5 * (loss_anc_mean + loss_ear_mean) if self.enable_early else loss_anc_mean).detach()
+        if self.reduction == "active_mean":
+            tot_aux = (loss_anc_mean + loss_ear_mean) if self.enable_early else loss_anc_mean
+            tot_obs = tot_aux.detach()
+        else:
+            tot_aux = 0.5 * (loss_anc_batch + loss_ear_batch) if self.enable_early else loss_anc_batch
+            tot_obs = (0.5 * (loss_anc_mean + loss_ear_mean) if self.enable_early else loss_anc_mean).detach()
         n_usa_a  = max(1.0, float(usable_a.float().sum().item()))
         bys_frac = float(bys_mask_a.float().sum().item()) / n_usa_a
         stats = {

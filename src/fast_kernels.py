@@ -624,7 +624,9 @@ def extract_clean_kv_fast(
     kv_list = []
     B_tot, T, D = clean_inputs[0].shape
     B_u = b_indices.shape[0]
-    all_seqs = (B_u == B_tot)
+    all_seqs = (B_u == B_tot) and bool(
+        torch.equal(b_indices, torch.arange(B_tot, device=b_indices.device, dtype=b_indices.dtype))
+    )
     H, Dh = blocks[0].cfg.n_heads, blocks[0].cfg.head_dim
     cos_c = cos_full[:, :, :T, :].reshape(T, Dh // 2).contiguous()
     sin_c = sin_full[:, :, :T, :].reshape(T, Dh // 2).contiguous()
@@ -751,6 +753,9 @@ def _grouped_flash_prefix_kv_kernel(
 def build_seq_groups(kv_slot: Tensor, B_u: int, G: int) -> tuple[Tensor, Tensor]:
     """Splits sorted `kv_slot` `[N_pos]` into same-sequence groups of `<= G` positions in `< 0.04 ms`."""
     N_pos = kv_slot.shape[0]
+    if N_pos == 0:
+        empty = torch.empty((0,), device=kv_slot.device, dtype=torch.int32)
+        return empty, empty
     if G <= 1:
         ar = torch.arange(N_pos, device=kv_slot.device, dtype=torch.int32)
         return ar, ar + 1

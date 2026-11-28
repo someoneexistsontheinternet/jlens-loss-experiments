@@ -15,14 +15,15 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from model_70m import NanoGPT70MConfig, NanoGPT70M
-from fast_kernels import extract_clean_kv_fast
+from fast_kernels import extract_clean_kv_fast, build_seq_groups
 from ultra_probe_kernels import advance_local_window_kv_ultra
 from jlens_wave8 import Wave8SteinJLensController
 from jlens_ablation import (
     FrozenSoftcapReadout, WorkspaceJLens, select_diverse_fast, select_diverse_from_pool,
-    suppress_oblique_single_and_joint, compute_feature_loss, compute_feature_loss_pregathered, calibrate_usefulness,
+    suppress_oblique_single_and_joint, compute_feature_loss, compute_feature_loss_pregathered,
+    compute_effective_feature_weights, calibrate_usefulness,
     extract_clean_kv_for_blocks, advance_local_window_kv, _compiled_cluster_select_indices,
-    CausalAblationJLensController,
+    _SelectedSoftcapLinearLogProbsFn, CausalAblationJLensController, EOT_TOKEN,
 )
 
 
@@ -468,13 +469,20 @@ def main():
     print(f"PASS 13: Verified Bystander Eviction + SNR Cleanups (grads={[round(x,3) for x in g_b]}, bys_frac={st_bs['bys_frac']:.2f})")
 
     # 14. Verify Zero-FLOP Shared-Op Gold SFT (`gold_w`, including duplicate `y_gold in ids_a`!) & Shared-Position 8-Horizon Lookahead (`shared_w8_weight`):
+    ctrl_gsft_ref = CausalAblationJLensController(
+        m_hyb, device=device, enable_early=False, anchor_layer=9,
+        active_frac=0.02, pool_size=256, k_dirs=8, window=1, select_mode="kmeans",
+        loss_kind="exp_signed_clamped", exp_beta=6.0, bystander_tau=0.05, bystander_w=0.25, gamma_max=1.0,
+        gold_w=0.0,
+    )
     ctrl_gsft = CausalAblationJLensController(
         m_hyb, device=device, enable_early=False, anchor_layer=9,
         active_frac=0.02, pool_size=256, k_dirs=8, window=1, select_mode="kmeans",
         loss_kind="exp_signed_clamped", exp_beta=6.0, bystander_tau=0.05, bystander_w=0.25, gamma_max=1.0,
         gold_w=0.15,
     )
-    assert abs(ctrl_gsft.estimate_call_flops(8) - ctrl_bys.estimate_call_flops(8)) == 0.0, "Expected 0.000% extra FLOPs for gold_w!"
+    assert abs(ctrl_gsft.estimate_call_flops(8) - ctrl_gsft_ref.estimate_call_flops(8)) == 0.0, "Expected 0.000% extra FLOPs for gold_w!"
+    assert ctrl_gsft.estimate_call_flops(8) > ctrl_bys.estimate_call_flops(8), "Expected pool_size=256 FLOPs > pool_size=64!"
     ctrl_gsft.refresh_snapshot(m_hyb, int_h_det, xraw_h, yb=yb_h)
     m_hyb.zero_grad(set_to_none=True)
     ce_g, nll_g, int_g, _ = m_hyb(xb_h, yb_h, return_interm=True)
@@ -584,6 +592,181 @@ def main():
             # Note: `tok_emb` is used as input embedding at layer 0 so `aux_v2` backprops into `tok_emb` ONLY via `x_0`, never via `readout`!
             assert torch.isfinite(aux_v2) and st_v2["k_filled"] == 8.0
     print("PASS 16: Verified Faithful V2 (`identity`, `true_jacobian`, `live_readout`, `reuse_clean_nll`, `bystander_unscaled`, `split_6_9`, & `random_gap4`)!")
+
+    # 17. Verify V3 P0-4 (FP32 Selected-Slot Bwd at V=50304 & p0>0.998 + duplicate IDs), P0-5 (`norm_w_dir=1` exact logit zeroing),
+    #     and P0-2 (`exp_unlikelihood` 0% sign inversion + pure zero-grad deadzone + widened clamp):
+    if device.type == "cuda":
+        V50, D50 = 50304, 512
+        U50_bf = (F.normalize(torch.randn((V50, D50), device=device), dim=-1) * 0.5).to(torch.bfloat16)
+        U50_bf[0].zero_()
+        U50_bf[0, 0] = 0.5
+        hn50_bf = (0.05 * torch.randn((4, D50), device=device)).to(torch.bfloat16)
+        hn50_bf[:, 0] = 44.0  # Exact dyadic raw_0 = 22.0 in BF16 & FP64 -> p0 ~ 0.9994 > 0.998!
+        for case_name, ids50, g50 in [
+            ("distinct_high_p", torch.tensor([[0, 1, 2, 3]] * 4, device=device), torch.tensor([[-1.0, 0.0, 0.0, 0.0]] * 4, device=device)),
+            ("dup_ids_high_p",  torch.tensor([[0, 1, 0, 2]] * 4, device=device), torch.tensor([[-0.6, 0.15, -0.4, 0.15]] * 4, device=device)),
+        ]:
+            hn_fast = hn50_bf.float().detach().requires_grad_(True)
+            lq_fast = _SelectedSoftcapLinearLogProbsFn.apply(hn_fast, U50_bf, ids50, 30.0, 16384)
+            p0_obs = float(lq_fast[:, 0].exp().min().item())
+            assert p0_obs > 0.998, f"Expected p0 > 0.998 for {case_name}, got {p0_obs}"
+            (lq_fast * g50).sum().backward()
+
+            hn_ref64 = hn50_bf.double().detach().requires_grad_(True)
+            raw64 = hn_ref64 @ U50_bf.double().t()
+            lg64 = 30.0 * torch.tanh(raw64 / 30.0)
+            lq64 = lg64.log_softmax(dim=-1).gather(1, ids50)
+            (lq64 * g50.double()).sum().backward()
+
+            assert hn_fast.grad.norm().item() > 0.0, f"Zeroed gradient in {case_name}!"
+            rel_err_50 = float((hn_fast.grad.double() - hn_ref64.grad).norm().item() / hn_ref64.grad.norm().clamp_min(1e-12).item())
+            assert rel_err_50 < 2e-2, f"{case_name} FP32 selected-slot bwd rel_err={rel_err_50:.4f} >= 2e-2 (p0={p0_obs:.5f})"
+        bwd_msg = f"V=50304 p0={p0_obs:.5f} rel_err={rel_err_50:.4f}"
+    else:
+        bwd_msg = "CPU-skipped-CUDA-kernel"
+
+    # P0-5: `norm_w_dir=1` exact logit zeroing when `out_norm.weight != 1`, plus `is_identity` skip parity:
+    D_nw, V_nw = 64, 128
+    norm_w_aniso = torch.exp(torch.linspace(-1.0, 1.2, D_nw, device=device))
+    U_nw = torch.randn((V_nw, D_nw), device=device) * 0.2
+    ro_nw = FrozenSoftcapReadout(norm_w_aniso, U_nw, softcap=30.0).to(device)
+    J_nw = torch.eye(D_nw, device=device) + 0.15 * torch.randn((D_nw, D_nw), device=device)
+    x_nw = torch.randn((8, D_nw), device=device)
+    ids_nw = torch.arange(4, device=device).unsqueeze(0).expand(8, 4)
+    val_nw = torch.ones((8, 4), dtype=torch.bool, device=device)
+
+    for is_id_case in (False, True):
+        lens_nw_on = WorkspaceJLens(D_nw, ro_nw, device, norm_input=False, is_identity=is_id_case, norm_w_dir=True).to(device)
+        lens_nw_off = WorkspaceJLens(D_nw, ro_nw, device, norm_input=False, is_identity=is_id_case, norm_w_dir=False).to(device)
+        if not is_id_case:
+            with torch.no_grad():
+                lens_nw_on.J.copy_(J_nw)
+                lens_nw_off.J.copy_(J_nw)
+        w_on, d_on, _ = lens_nw_on.candidate_vectors(ids_nw, metric="euclidean")
+        w_off, d_off, _ = lens_nw_off.candidate_vectors(ids_nw, metric="euclidean")
+        if is_id_case:
+            torch.testing.assert_close(w_on, U_nw[ids_nw] * norm_w_aniso)
+        pr_on, _, _ = suppress_oblique_single_and_joint(x_nw, w_on, d_on, val_nw, strength=1.0, match_norm=True, include_clean=False, include_joint=False)
+        pr_off, _, _ = suppress_oblique_single_and_joint(x_nw, w_off, d_off, val_nw, strength=1.0, match_norm=True, include_clean=False, include_joint=False)
+        lg_on = ro_nw.logits(lens_nw_on.project_hidden(pr_on.reshape(-1, D_nw))).view(8, 4, V_nw)
+        lg_off = ro_nw.logits(lens_nw_off.project_hidden(pr_off.reshape(-1, D_nw))).view(8, 4, V_nw)
+        leak_on = max(abs(float(lg_on[b, j, j].item())) for b in range(8) for j in range(4))
+        leak_off = max(abs(float(lg_off[b, j, j].item())) for b in range(8) for j in range(4))
+        assert leak_on < 1e-5, f"norm_w_dir=True failed to zero logit (is_id={is_id_case}): max_leak={leak_on}"
+        assert leak_off > 0.05, f"Expected non-trivial leak with norm_w_dir=False, got {leak_off}"
+
+    # P0-2: `exp_unlikelihood` strictly positive dL/dz_harmful at q0=0.60 with bystanders (0% sign inversion!), pure deadzone, widened clamp:
+    probs_inv = torch.tensor([[0.60, 0.05, 0.002, 0.002, 0.002, 0.002, 0.342]], device=device)
+    u_inv = torch.tensor([[-0.30, 0.20, 0.01, -0.01, 0.02, -0.02]], device=device)
+    ids_inv = torch.arange(6, device=device).unsqueeze(0)
+    val_inv = torch.ones((1, 6), dtype=torch.bool, device=device)
+    z_eul = probs_inv.log().detach().requires_grad_(True)
+    l_eul = compute_feature_loss(
+        z_eul.log_softmax(-1), ids_inv, u_inv, val_inv,
+        loss_kind="exp_unlikelihood", exp_beta=6.0, exp_norm=True,
+        bystander_tau=0.05, bystander_w=0.25, bystander_unscaled=True,
+    ).sum()
+    l_eul.backward()
+    assert float(l_eul.item()) >= 0.0 and float(z_eul.grad[0, 0].item()) > 0.10, (
+        f"exp_unlikelihood failed zero-sign-inversion check: loss={l_eul.item()}, dL/dz0={z_eul.grad[0,0].item()}"
+    )
+    # Pure deadzone (`w_bys=0.0`) + widened clamp (`|u| = 1.5` preserved, not clipped to 0.6):
+    lq_dz3 = probs_inv.log().log_softmax(-1)[:, :6].detach().clone().requires_grad_(True)
+    l_dz3 = compute_feature_loss_pregathered(
+        lq_dz3, u_inv, val_inv,
+        loss_kind="exp_unlikelihood", exp_beta=6.0, exp_norm=True, bystander_tau=0.05, bystander_w=0.0,
+    ).sum()
+    l_dz3.backward()
+    assert all(abs(float(lq_dz3.grad[0, j].item())) < 1e-7 for j in (2, 3, 4, 5)), f"Deadzone leaked grad: {lq_dz3.grad}"
+    ut_wide = compute_effective_feature_weights(
+        torch.tensor([[1.5, -0.8]], device=device), torch.ones((1, 2), dtype=torch.bool, device=device),
+        exp_beta=0.0, u_clamp=5.0, shift_neg_by_bys=False,
+    )
+    assert abs(float(ut_wide[0, 0].item()) - 1.5) < 1e-6 and abs(float(ut_wide[0, 1].item()) + 0.8) < 1e-6
+    # Verify C^1 linear continuation past z=3.6 prevents e^30 winner-take-all batch collapse on a u=4.0 outlier:
+    u_out128 = torch.full((1, 129), 0.25, device=device)
+    u_out128[0, 0] = 4.0
+    ut_out128 = compute_effective_feature_weights(
+        u_out128, torch.ones_like(u_out128, dtype=torch.bool),
+        exp_beta=6.0, exp_norm=True, u_clamp=5.0, shift_neg_by_bys=False,
+    )
+    share_128 = float(ut_out128[0, 0].item() / ut_out128.sum().item())
+    norm_128  = float(ut_out128[0, 1].item())
+    assert share_128 < 0.70 and norm_128 > 0.08, f"C^1 outlier collapse at N=128: share={share_128:.4f}, norm={norm_128:.4f}"
+    u_out1k = torch.full((1, 1025), 0.25, device=device)
+    u_out1k[0, 0] = 4.0
+    ut_out1k = compute_effective_feature_weights(
+        u_out1k, torch.ones_like(u_out1k, dtype=torch.bool),
+        exp_beta=6.0, exp_norm=True, u_clamp=5.0, shift_neg_by_bys=False,
+    )
+    share_1k = float(ut_out1k[0, 0].item() / ut_out1k.sum().item())
+    norm_1k  = float(ut_out1k[0, 1].item())
+    assert share_1k < 0.30 and norm_1k > 0.15, f"C^1 outlier collapse at N=1024: share={share_1k:.4f}, norm={norm_1k:.4f}"
+    print(f"PASS 17: Verified V3 P0-4 ({bwd_msg}), P0-5 (norm_w_dir leak={leak_on:.2e} vs {leak_off:.2f}), & P0-2 (exp_unlikelihood dL/dz0=+{z_eul.grad[0,0].item():.4f}, out1k_share={share_1k:.3f})")
+
+    # 18. Verify V3 P0-6 (`tracked_layers` excludes unused `early_layer`), P0-3 (`active_mean` scale invariance across active_frac
+    #     & additive early+anchor), P1 edge-case guards (`n_easy_elig==0` OOB & `build_seq_groups(N=0)`), & P2 FLOP accounting:
+    ctrl_l9_v3 = CausalAblationJLensController(
+        m12, device=device, enable_early=False, early_layer=3, anchor_layer=9,
+        j_mode="true_jacobian", norm_w_dir=True, coalition_norm=False,
+        loss_kind="exp_unlikelihood", reduction="active_mean",
+    )
+    assert ctrl_l9_v3.tracked_layers == [9] and ctrl_l9_v3.lens_early is None, f"Unexpected tracked_layers={ctrl_l9_v3.tracked_layers}"
+    ctrl_s69_v3 = CausalAblationJLensController(
+        m12, device=device, enable_early=False, layer_mode="split_6_9",
+        j_mode="true_jacobian", norm_w_dir=True, coalition_norm=False,
+        loss_kind="exp_unlikelihood", reduction="active_mean",
+    )
+    assert ctrl_s69_v3.tracked_layers == [6, 7, 8, 9], f"Unexpected split_6_9 tracked_layers={ctrl_s69_v3.tracked_layers}"
+
+    # Verify `active_mean` scale invariance across active_frac=0.05 vs 0.20 (both equal `loss_anc`, NOT 4x different!):
+    xb_v3 = torch.randint(0, 500, (8, 256), device=device)
+    yb_v3 = torch.randint(0, 500, (8, 256), device=device)
+    ce_v3, nll_v3, int_v3, xraw_v3 = m_hyb(xb_v3, yb_v3, return_interm=True)
+    losses_am = []
+    for af_v3 in (0.05, 0.20):
+        c_am = CausalAblationJLensController(
+            m_hyb, device=device, enable_early=False, anchor_layer=9, active_frac=af_v3,
+            pool_size=64, k_dirs=8, window=1, select_mode="greedy_cos", metric="euclidean",
+            j_mode="identity", norm_w_dir=True, coalition_norm=False, live_readout=True, reuse_clean_nll=False,
+            pos_mode="uniform", loss_kind="exp_unlikelihood", exp_beta=6.0, reduction="active_mean",
+        )
+        aux_am, obs_am, st_am = c_am.compute_loss(m_hyb, int_v3, yb_v3, nll_v3)
+        assert abs(float(aux_am.item()) - st_am["loss_anc"]) < 1e-4 and abs(float(obs_am.item()) - float(aux_am.item())) < 1e-5
+        losses_am.append(float(aux_am.item()))
+    ratio_am = losses_am[1] / max(losses_am[0], 1e-6)
+    assert 0.4 < ratio_am < 2.5, f"active_mean not scale-invariant across 4x active_frac: {losses_am} (ratio={ratio_am:.2f})"
+
+    # Verify `enable_early=True` + `reduction="active_mean"` is additive (`loss_anc + loss_ear`, matching demo:333):
+    c_ear_am = CausalAblationJLensController(
+        m_hyb, device=device, enable_early=True, early_layer=3, anchor_layer=9, active_frac=0.05,
+        pool_size=64, k_dirs=4, window=1, select_mode="greedy_cos", metric="euclidean",
+        j_mode="identity", norm_w_dir=True, coalition_norm=False, live_readout=True,
+        pos_mode="uniform", loss_kind="exp_unlikelihood", reduction="active_mean",
+    )
+    aux_eam, _, st_eam = c_ear_am.compute_loss(m_hyb, int_v3, yb_v3, nll_v3)
+    assert abs(float(aux_eam.item()) - (st_eam["loss_anc"] + st_eam["loss_ear"])) < 1e-4
+    m_hyb.zero_grad(set_to_none=True)
+    (ce_v3 + 0.05 * aux_eam).backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in m_hyb.parameters())
+
+    # Verify `select_probe_positions` when `n_valid <= k_pool_hard` (`n_easy_elig == 0` -> zero OOB/invalid/dup indices!):
+    yb_eot = torch.full((2, 32), EOT_TOKEN, dtype=torch.long, device=device)
+    yb_eot[0, 5:10] = 42  # only positions 5, 6 valid for W=4
+    yb_eot[1, 12:17] = 43 # only positions 12, 13 valid for W=4
+    nll_eot = torch.rand((2, 32), device=device)
+    c_oob = CausalAblationJLensController(m12, device=device, enable_early=False, anchor_layer=9, active_frac=0.05, window=4, pos_mode="hard_easy")
+    b_o, p_o, _, _ = c_oob.select_probe_positions(yb_eot, nll_eot)
+    assert b_o.numel() == 3 and bool((p_o + 4 <= 32).all().item())
+    assert len(set(zip(b_o.tolist(), p_o.tolist()))) == b_o.numel()
+    for bi, pi in zip(b_o.tolist(), p_o.tolist()):
+        assert bool((yb_eot[bi, pi : pi + 4] != EOT_TOKEN).all().item()), f"Selected EOT window at ({bi},{pi})!"
+
+    # Verify `build_seq_groups` handles `N_pos == 0` cleanly + FLOP counter monotonic across pool/select/j_mode/refresh:
+    gs0, ge0 = build_seq_groups(torch.empty((0,), dtype=torch.int32, device=device), 4, 3)
+    assert gs0.numel() == 0 and ge0.numel() == 0
+    assert ctrl_l9_v3.estimate_refresh_flops(8) > 0.0
+    print(f"PASS 18: Verified V3 P0-6 (tracked={ctrl_l9_v3.tracked_layers}), P0-3 (active_mean ratio={ratio_am:.2f}), OOB/empty guards, & FLOP counter!")
     print("ALL VERIFICATION CHECKS PASSED.")
 
 

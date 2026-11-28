@@ -56,7 +56,7 @@ def main():
         jmode = meta.get("jlens_mode", summary.get("jlens_mode", "none"))
         kind  = meta.get("kind", summary.get("kind", "train"))
 
-        if jmode in ("ablation", "hybrid", "hybrid_wave8_abl") or gz_path.name.startswith(("05", "06", "07", "08", "09", "10", "11", "12", "13", "14")):
+        if jmode in ("ablation", "hybrid", "hybrid_wave8_abl") or gz_path.name.startswith(("05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16")):
             tot_phase4_gpu_h += gpu_h
         elif jmode and jmode != "none":
             tot_jlens_gpu_h += gpu_h
@@ -80,9 +80,18 @@ def main():
             "linear_mode": lmode,
             "jlens_mode": jmode,
             "jlens_weight": meta.get("jlens_weight", 0.0),
+            "jlens_start_step": meta.get("jlens_start_step", None),
+            "jlens_flat_end_frac": meta.get("jlens_flat_end_frac", None),
             "abl_active_frac": meta.get("abl_active_frac", None),
             "abl_pool_size": meta.get("abl_pool_size", None),
             "abl_select_mode": meta.get("abl_select_mode", None),
+            "abl_loss_kind": meta.get("abl_loss_kind", None),
+            "abl_reduction": meta.get("abl_reduction", None),
+            "abl_j_mode": meta.get("abl_j_mode", None),
+            "abl_norm_w_dir": meta.get("abl_norm_w_dir", None),
+            "abl_coalition_norm": meta.get("abl_coalition_norm", None),
+            "abl_pos_mode": meta.get("abl_pos_mode", None),
+            "seed": meta.get("seed", None),
             "extra_flops_pct": summary.get("extra_flops_pct", 0.0),
             "opt": meta.get("opt", ""),
             "lr": meta.get("lr", None),
