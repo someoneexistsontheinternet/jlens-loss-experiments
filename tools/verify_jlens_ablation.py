@@ -401,6 +401,31 @@ def main():
     assert g_b[1] > 0.10 and abs(g_b[1] - g_b[2]) < 1e-6, f"Expected identical unweighted bystander eviction on +/-0.02, got {g_b}"
     assert g_b[2] < g_b[3] < g_b[4], f"Expected strict monotonicity across -tau: {g_b}"
 
+    # Verify Pure Noise-Floor Deadzone (`bystander_tau=0.05, bystander_w=0.0` -> exact 0.0 grad on |u_c| < 0.05!)
+    z_dz = torch.tensor([[-4.6, -4.6, -4.6, -4.6, -4.6, 0.0]], device=device, requires_grad=True)
+    l_dz = compute_feature_loss(
+        z_dz.log_softmax(-1), ids_bys, w_bys_test, val_bys,
+        loss_kind="exp_signed_clamped", exp_beta=6.0, exp_norm=True, bystander_tau=0.05, bystander_w=0.0,
+    ).sum()
+    l_dz.backward()
+    g_dz = z_dz.grad[0, :5].tolist()
+    assert g_dz[0] < -0.10 and abs(g_dz[1]) < 1e-5 and abs(g_dz[2]) < 1e-5 and 0.0 < g_dz[3] < g_dz[4], f"Deadzone grad mismatch: {g_dz}"
+
+    # Verify `pool_size=128` and `pool_size=256` across `greedy_cos`, `maxmin`, `kmeans`, `emeans` (surfacing rivals at ranks 65..255!):
+    ro_256 = FrozenSoftcapReadout(torch.ones(64, device=device), F.normalize(torch.randn((512, 64), device=device), dim=-1), softcap=30.0).to(device)
+    lens_256 = WorkspaceJLens(64, ro_256, device).to(device)
+    x_256 = torch.randn((16, 64), device=device)
+    for p_sz in (128, 256):
+        pl_p, pr_p = lens_256.topk_pool_ids_and_probs(x_256, pool_size=p_sz)
+        assert pl_p.shape == (16, p_sz) and pr_p.shape == (16, p_sz)
+        for smode in ("greedy_cos", "maxmin", "kmeans", "emeans"):
+            ids_p, _, _, val_p = select_diverse_from_pool(
+                pl_p, lens_256, k=8, max_cosine=0.85, metric="cov", select_mode=smode, pool_probs=pr_p
+            )
+            assert ids_p.shape == (16, 8) and bool(val_p.any().item())
+            if smode != "greedy_cos":
+                assert bool(val_p.all().item()), f"{smode} failed to fill k=8 at pool_size={p_sz}"
+
     # Verify `live_target_head=1` + `nll_cap=6.5` end-to-end inside CausalAblationJLensController:
     ctrl_bys = CausalAblationJLensController(
         m_hyb, device=device, enable_early=False, anchor_layer=9,

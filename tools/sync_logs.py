@@ -81,6 +81,7 @@ def main():
             "jlens_mode": jmode,
             "jlens_weight": meta.get("jlens_weight", 0.0),
             "abl_active_frac": meta.get("abl_active_frac", None),
+            "abl_pool_size": meta.get("abl_pool_size", None),
             "abl_select_mode": meta.get("abl_select_mode", None),
             "extra_flops_pct": summary.get("extra_flops_pct", 0.0),
             "opt": meta.get("opt", ""),

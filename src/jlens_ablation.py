@@ -645,11 +645,13 @@ def select_diverse_from_pool(
             return ids_out, w_out, d_out, final_val
 
         cos_mat = G_signed.abs()
-        if pool.is_cuda and M_pool <= 64:
+        if pool.is_cuda and M_pool <= 256:
+            block_m = max(64, triton.next_power_of_2(M_pool))
+            nw = 4 if block_m >= 128 else 2
             acc_i8 = torch.empty((B, M_pool), dtype=torch.int8, device=pool.device)
             _greedy_diverse_accept_kernel[(B,)](
                 sim_norms.contiguous(), cos_mat.contiguous(), acc_i8,
-                M_pool, k, float(max_cosine), BLOCK_M=64, num_warps=2,
+                M_pool, k, float(max_cosine), BLOCK_M=block_m, num_warps=nw,
             )
             accepted = acc_i8.bool()
         else:

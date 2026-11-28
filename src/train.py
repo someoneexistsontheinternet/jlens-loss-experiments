@@ -317,6 +317,7 @@ def main():
             "abl_layer_mode": args.abl_layer_mode,
             "abl_active_frac": args.abl_active_frac,
             "abl_probe_seqs": args.abl_probe_seqs,
+            "abl_pool_size": args.abl_pool_size,
             "abl_k": args.abl_k,
             "abl_window": args.abl_window,
             "abl_select_mode": args.abl_select_mode,
