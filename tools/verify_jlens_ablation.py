@@ -269,6 +269,155 @@ def main():
     aux_ra, _, st_ra = ctrl_ra.compute_loss(m12, int12, yb12, nll12)
     assert st_ra["l_anc"] in (7, 8, 9, 10) and torch.isfinite(aux_ra)
     print(f"PASS 10: Verified `exp_signed_clamped` (q=0.01 grad={z_esc.grad[0,0].item():.4f}, log_q<-9 grad=0.0) & `random_anc_7_10` (sampled={st_ra['l_anc']})")
+
+    # 11. Verify Fused Hybrid (`Wave8SteinJLensController` sparse taps + `CausalAblationJLensController` sharing ONE `interm` pass):
+    from jlens_wave8 import Wave8SteinJLensController
+    cfg_hyb = NanoGPT70MConfig(n_layers=12, d_model=64, n_heads=2, head_dim=32, d_ff=128, vocab_pad=512, seq_len=256, ce_backend="eager")
+    m_hyb = NanoGPT70M(cfg_hyb).to(device).train()
+    w8_full = Wave8SteinJLensController(
+        n_layers=12, d_model=64, vocab_pad=512, micro_tokens=8 * 256, device=device, k_vocab=64,
+    )
+    w8_sparse = Wave8SteinJLensController(
+        n_layers=12, d_model=64, vocab_pad=512, micro_tokens=8 * 256, device=device, k_vocab=64, layer_indices=[3, 5, 7, 9],
+    )
+    assert w8_full.n_jlens == 10 and w8_sparse.n_jlens == 4
+    assert abs(w8_sparse.estimate_call_flops(False) / w8_full.estimate_call_flops(False) - 0.40) < 1e-6
+    ctrl_hyb_abl = CausalAblationJLensController(
+        m_hyb, device=device, enable_early=False, anchor_layer=9,
+        active_frac=0.02, k_dirs=4, window=1, loss_kind="exp_signed_clamped", exp_beta=6.0,
+    )
+    xb_h = torch.randint(0, 500, (8, 256), device=device)
+    yb_h = torch.randint(0, 500, (8, 256), device=device)
+    m_hyb.zero_grad(set_to_none=True)
+    ce_h, nll_h, int_h, xraw_h = m_hyb(xb_h, yb_h, return_interm=True)
+    int_h_det = [t.detach() for t in int_h]
+    w8_sparse.refresh_lenses(int_h_det, xraw_h, yb_h)
+    ctrl_hyb_abl.refresh_snapshot(m_hyb, int_h_det, xraw_h)
+    cids_h = w8_sparse.sample_vocab_candidates()
+    loss_w8, _ = w8_sparse.compute_loss(int_h, m_hyb.out_norm.weight, m_hyb.tok_emb.weight, yb_h, nll_h, cids_h)
+    loss_ab, _, st_h = ctrl_hyb_abl.compute_loss(m_hyb, int_h, yb_h, nll_h)
+    (ce_h + 0.05 * loss_w8 + 0.50 * loss_ab).backward()
+    assert torch.isfinite(loss_w8) and torch.isfinite(loss_ab)
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in m_hyb.parameters())
+    print(f"PASS 11: Verified Hybrid `Wave8 + CausalAblation` shared-interm fwd+bwd (w8={loss_w8.item():.4f}, abl={loss_ab.item():.5f}, sparse_ratio=0.40)")
+
+    # 12. Verify `maxmin`, `kmeans`, and `emeans` (threshold-free clustering, synonym collapse, rival surfacing, 100% k slots, GPU speed):
+    import time
+    from jlens_ablation import FrozenSoftcapReadout, WorkspaceJLens
+    V_syn, D_syn = 64, 32
+    U_syn = torch.zeros((V_syn, D_syn), dtype=torch.float32, device=device)
+    g_syn = torch.Generator(device="cpu").manual_seed(777)
+    # 50 near-identical synonyms around e_0 (cos > 0.998):
+    noise_50 = torch.randn((50, D_syn), generator=g_syn).to(device) * 0.01
+    U_syn[:50] = F.normalize(F.one_hot(torch.zeros(50, dtype=torch.long, device=device), D_syn).float() + noise_50, dim=-1)
+    # 7 strong orthogonal rival modes along e_1..e_7:
+    for r_i in range(7):
+        U_syn[50 + r_i, 1 + r_i] = 1.0
+    # 7 near-zero-mass orthogonal noise modes along e_8..e_14:
+    for r_i in range(7):
+        U_syn[57 + r_i, 8 + r_i] = 1.0
+
+    ro_syn = FrozenSoftcapReadout(torch.ones(D_syn, device=device), U_syn, softcap=30.0).to(device)
+    lens_syn = WorkspaceJLens(D_syn, ro_syn, device, norm_input=False).to(device)
+    pool_syn = torch.arange(64, device=device, dtype=torch.long).unsqueeze(0).expand(4, 64).contiguous()
+    raw_lg = torch.empty((64,), dtype=torch.float32, device=device)
+    raw_lg[:50]   = torch.linspace(12.0, 10.0, 50, device=device)   # high-prob duplicate synonym cluster
+    raw_lg[50:57] = torch.linspace(6.0, 5.0, 7, device=device)      # legitimate orthogonal rivals
+    raw_lg[57:64] = -8.0                                            # near-zero-mass tail noise
+    probs_syn = F.softmax(raw_lg, dim=-1).unsqueeze(0).expand(4, 64).contiguous()
+
+    for smode in ("maxmin", "kmeans", "emeans"):
+        ids_s, w_s, d_s, val_s = select_diverse_from_pool(
+            pool_syn, lens_syn, k=8, metric="cov", select_mode=smode, pool_probs=probs_syn
+        )
+        assert bool(val_s.all().item()), f"{smode} failed to fill all k=8 slots!"
+        for b_i in range(4):
+            picked = [int(x) for x in ids_s[b_i].tolist()]
+            assert len(set(picked)) == 8, f"{smode} returned duplicate IDs: {picked}"
+            n_from_syn   = sum(0 <= x < 50 for x in picked)
+            n_from_rival = sum(50 <= x < 57 for x in picked)
+            n_from_noise = sum(57 <= x < 64 for x in picked)
+            assert n_from_syn == 1 and n_from_rival == 7 and n_from_noise == 0, (
+                f"{smode} failed synonym collapse / rival surfacing: syn={n_from_syn}, rival={n_from_rival}, noise={n_from_noise}, picked={picked}"
+            )
+
+        ctrl_sm = CausalAblationJLensController(
+            m_hyb, device=device, enable_early=False, anchor_layer=9,
+            active_frac=0.02, k_dirs=8, window=1, select_mode=smode,
+            loss_kind="exp_signed_clamped", exp_beta=6.0,
+        )
+        ctrl_sm.refresh_snapshot(m_hyb, int_h_det, xraw_h)
+        m_hyb.zero_grad(set_to_none=True)
+        ce_sm, nll_sm, int_sm, _ = m_hyb(xb_h, yb_h, return_interm=True)
+        aux_sm, _, st_sm = ctrl_sm.compute_loss(m_hyb, int_sm, yb_h, nll_sm)
+        (ce_sm + 0.5 * aux_sm).backward()
+        assert torch.isfinite(aux_sm) and abs(st_sm["k_filled"] - 8.0) < 1e-4
+
+    speed_msg = ""
+    if device.type == "cuda":
+        from jlens_ablation import _compiled_cluster_select_indices
+        u_bench = F.normalize(torch.randn((1311, 64, 64), device=device), dim=-1)
+        G_bench = torch.bmm(u_bench, u_bench.transpose(-1, -2)).clamp(-1.0, 1.0)
+        p_bench = F.softmax(torch.randn((1311, 64), device=device), dim=-1)
+        v_bench = torch.ones((1311, 64), dtype=torch.bool, device=device)
+        for smode in ("maxmin", "kmeans", "emeans"):
+            for _ in range(3):
+                _compiled_cluster_select_indices(G_bench, p_bench, v_bench, 8, smode)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(20):
+                _compiled_cluster_select_indices(G_bench, p_bench, v_bench, 8, smode)
+            torch.cuda.synchronize()
+            dt_ms = (time.perf_counter() - t0) * 1000.0 / 20.0
+            speed_msg += f" {smode}={dt_ms:.3f}ms"
+            assert dt_ms < 5.0, f"{smode} too slow on GPU: {dt_ms:.3f}ms"
+    print(f"PASS 12: Verified `maxmin`, `kmeans`, `emeans` (8/8 distinct slots, 50->1 synonym collapse + 7/7 rivals;{speed_msg})")
+
+    # 13. Verify Bystander Eviction + SNR Cleanups (`gamma_max=1.0`, `bystander_tau/w` monotonicity, `live_target_head=1`, `nll_cap`):
+    from jlens_ablation import calibrate_usefulness
+    raw_u_g = torch.tensor([[0.03, 0.02, 0.01, 0.02]], device=device)
+    u_all_g = torch.tensor([1.0], device=device)
+    val_g   = torch.ones_like(raw_u_g, dtype=torch.bool)
+    usa_g   = torch.tensor([True], device=device)
+    u_g4 = calibrate_usefulness(raw_u_g, u_all_g, val_g, usa_g, coalition_norm=True, gamma_max=4.0)
+    u_g1 = calibrate_usefulness(raw_u_g, u_all_g, val_g, usa_g, coalition_norm=True, gamma_max=1.0)
+    assert float(u_g4[0, 0].item()) > 0.11 and abs(float(u_g1[0, 0].item()) - 0.03) < 1e-6
+
+    # Check exact bystander eviction gradient directions & strict monotonicity across `-tau`:
+    # Slots 0..4 have identical log_q (~0.01 prob) and weights: [+0.25 (helpful), +0.02 (bystander), -0.02 (bystander), -0.06 (just harmful), -0.25 (distractor)]
+    z_bys = torch.tensor([[-4.6, -4.6, -4.6, -4.6, -4.6, 0.0]], device=device, requires_grad=True)
+    w_bys_test = torch.tensor([[0.25, 0.02, -0.02, -0.06, -0.25]], device=device)
+    ids_bys = torch.tensor([[0, 1, 2, 3, 4]], device=device)
+    val_bys = torch.ones((1, 5), dtype=torch.bool, device=device)
+    l_bys = compute_feature_loss(
+        z_bys.log_softmax(-1), ids_bys, w_bys_test, val_bys,
+        loss_kind="exp_signed_clamped", exp_beta=6.0, exp_norm=True, bystander_tau=0.05, bystander_w=0.30,
+    ).sum()
+    l_bys.backward()
+    g_b = z_bys.grad[0, :5].tolist()
+    # Helpful slot 0 pushes logit UP (dL/dz < 0); bystanders 1 & 2 get IDENTICAL positive eviction grad (> 0) discarding +/-0.02 noise;
+    # harmful slots 3 (-0.06) & 4 (-0.25) are strictly monotonic: 0 < g_b[1] == g_b[2] < g_b[3] < g_b[4]!
+    assert g_b[0] < -0.10, f"Expected strong negative dL/dz on helpful slot, got {g_b}"
+    assert g_b[1] > 0.10 and abs(g_b[1] - g_b[2]) < 1e-6, f"Expected identical unweighted bystander eviction on +/-0.02, got {g_b}"
+    assert g_b[2] < g_b[3] < g_b[4], f"Expected strict monotonicity across -tau: {g_b}"
+
+    # Verify `live_target_head=1` + `nll_cap=6.5` end-to-end inside CausalAblationJLensController:
+    ctrl_bys = CausalAblationJLensController(
+        m_hyb, device=device, enable_early=False, anchor_layer=9,
+        active_frac=0.02, k_dirs=8, window=1, select_mode="emeans",
+        loss_kind="exp_signed_clamped", exp_beta=6.0,
+        bystander_tau=0.05, bystander_w=0.25, gamma_max=1.0,
+        nll_cap=6.5, live_target_head=True,
+    )
+    ctrl_bys.refresh_snapshot(m_hyb, int_h_det, xraw_h)
+    with torch.no_grad():
+        m_hyb.tok_emb.weight.mul_(1.05)  # Perturb live head away from frozen snapshot
+    m_hyb.zero_grad(set_to_none=True)
+    ce_bs, nll_bs, int_bs, _ = m_hyb(xb_h, yb_h, return_interm=True)
+    aux_bs, _, st_bs = ctrl_bys.compute_loss(m_hyb, int_bs, yb_h, nll_bs)
+    (ce_bs + 0.5 * aux_bs).backward()
+    assert torch.isfinite(aux_bs) and 0.0 <= st_bs["bys_frac"] <= 1.0
+    print(f"PASS 13: Verified Bystander Eviction + SNR Cleanups (grads={[round(x,3) for x in g_b]}, bys_frac={st_bs['bys_frac']:.2f})")
     print("ALL VERIFICATION CHECKS PASSED.")
 
 

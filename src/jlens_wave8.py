@@ -65,12 +65,20 @@ class Wave8SteinJLensController:
         ridge: float = 0.10,
         ema: float = 0.90,
         softcap: float = 30.0,
+        layer_indices: list[int] | None = None,
     ):
         self.n_layers    = n_layers
         self.d_model     = d_model
         self.vocab_pad   = vocab_pad
         self.start_layer = start_layer   # 1 -> starts at L02 (~10% depth), supervising L02..L11 (10 layers)
-        self.n_jlens     = n_layers - 1 - start_layer
+        if layer_indices:
+            self.tap_layers = [int(l) for l in layer_indices]
+            assert all(2 <= l <= n_layers - 1 for l in self.tap_layers), f"Invalid tap_layers={self.tap_layers}"
+            self._contiguous_taps = False
+        else:
+            self.tap_layers = list(range(start_layer + 1, n_layers))
+            self._contiguous_taps = True
+        self.n_jlens     = len(self.tap_layers)
         self.horizons    = horizons
         self.k_vocab     = k_vocab
         self.ridge       = ridge
@@ -91,13 +99,13 @@ class Wave8SteinJLensController:
         self.k_tot  = k_tot
         self.n_blk  = n_blk
 
-        M_s = n_layers - 1 - start_layer
+        M_s = max(1, n_layers - 1 - start_layer)
         tok_h_idx = np.zeros((self.n_jlens, k_tot), dtype=np.int64)
         tok_imp_w = np.zeros((self.n_jlens, k_tot), dtype=np.float32)
         self.slices_per_layer = []
 
-        for l_i in range(self.n_jlens):
-            m = l_i
+        for l_i, l_1idx in enumerate(self.tap_layers):
+            m = max(0, l_1idx - (start_layer + 1))
             u = m / float(M_s)
             beta_l = 0.0 if m == 0 else (2.2 * (u ** 0.65) + 3.2 * (u ** 2))
             mu_l   = 1.0 + 4.2 * ((RHO_HARMONIC ** (0.85 * m) - RHO_HARMONIC ** (0.85 * M_s)) / (1.0 - RHO_HARMONIC ** (0.85 * M_s)))
@@ -190,8 +198,8 @@ class Wave8SteinJLensController:
         ridx = torch.randint(0, M_v, (K_r,), device=yb.device)
 
         x_s = torch.stack(
-            [pure_rms_norm(x_l[:, :T_v, :].reshape(M_v, self.d_model)[ridx]).float()
-             for x_l in interm_list[self.start_layer :]],
+            [pure_rms_norm(interm_list[l_1idx - 1][:, :T_v, :].reshape(M_v, self.d_model)[ridx]).float()
+             for l_1idx in self.tap_layers],
             dim=0,
         )  # (N_JL, K_r, D)
         xf_win = torch.stack([x_raw_final[:, h : T_v + h, :] for h in range(H)], dim=2).reshape(M_v, H, self.d_model)[ridx]
@@ -211,6 +219,15 @@ class Wave8SteinJLensController:
         w_star = w_flat.view(self.n_jlens, self.d_model, H, self.d_model).permute(0, 2, 1, 3).contiguous()
         self.jlens_mat.mul_(self.ema).add_(w_star, alpha=(1.0 - self.ema))
 
+    def estimate_call_flops(self, did_refresh: bool = False) -> float:
+        """Exact forward + backward FLOPs of `compute_loss` (plus amortized Stein Cholesky refresh if `did_refresh`)."""
+        D = float(self.d_model)
+        flops = float(self.n_jlens) * 4.0 * float(self.k_tot) * D * (D + float(self.k_vocab) + 1.0)
+        if did_refresh:
+            H = float(self.horizons)
+            flops += float(self.n_jlens) * (2.0 * 4096.0 * (1.0 + H) * (D ** 2) + (D ** 3) * (1.0 / 3.0 + 2.0 * H))
+        return flops
+
     def compute_loss(
         self,
         interm_list: list[torch.Tensor],
@@ -223,9 +240,14 @@ class Wave8SteinJLensController:
         M = yb.numel()
         sel_idx, y_kh, val_kh = self.select_hard10_easy5(yb, tok_nll_det)
 
-        x_all  = torch.stack([x_l.reshape(M, self.d_model)[sel_idx] for x_l in interm_list[self.start_layer - 1 :]], dim=0)
-        x_prev = x_all[:-1].detach()
-        x_stk  = pure_rms_norm(x_prev + (x_all[1:] - x_prev)).to(torch.bfloat16)
+        if self._contiguous_taps:
+            x_all  = torch.stack([x_l.reshape(M, self.d_model)[sel_idx] for x_l in interm_list[self.start_layer - 1 :]], dim=0)
+            x_prev = x_all[:-1].detach()
+            x_cur  = x_all[1:]
+        else:
+            x_cur  = torch.stack([interm_list[l - 1].reshape(M, self.d_model)[sel_idx] for l in self.tap_layers], dim=0)
+            x_prev = torch.stack([interm_list[l - 2].reshape(M, self.d_model)[sel_idx].detach() for l in self.tap_layers], dim=0)
+        x_stk  = pure_rms_norm(x_prev + (x_cur - x_prev)).to(torch.bfloat16)
 
         j_det  = self.jlens_mat.detach().to(torch.bfloat16)
         out_sc = out_norm_weight.detach().to(torch.bfloat16)

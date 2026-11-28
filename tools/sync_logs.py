@@ -56,7 +56,7 @@ def main():
         jmode = meta.get("jlens_mode", summary.get("jlens_mode", "none"))
         kind  = meta.get("kind", summary.get("kind", "train"))
 
-        if jmode == "ablation" or gz_path.name.startswith(("05", "06", "07", "08", "09")):
+        if jmode in ("ablation", "hybrid", "hybrid_wave8_abl") or gz_path.name.startswith(("05", "06", "07", "08", "09", "10")):
             tot_phase4_gpu_h += gpu_h
         elif jmode and jmode != "none":
             tot_jlens_gpu_h += gpu_h
@@ -81,6 +81,7 @@ def main():
             "jlens_mode": jmode,
             "jlens_weight": meta.get("jlens_weight", 0.0),
             "abl_active_frac": meta.get("abl_active_frac", None),
+            "abl_select_mode": meta.get("abl_select_mode", None),
             "extra_flops_pct": summary.get("extra_flops_pct", 0.0),
             "opt": meta.get("opt", ""),
             "lr": meta.get("lr", None),

@@ -154,13 +154,20 @@ def main():
     ap.add_argument("--fp8-block-k", type=int, default=128)
     ap.add_argument("--e8m0-mode", default="ceil_240", choices=["ceil_240", "ceil_pow2", "rne_240", "sr_240"])
     ap.add_argument("--hier-w-2d", type=int, default=0)
-    ap.add_argument("--jlens-mode", default="none", choices=["none", "wave8", "ablation"])
+    ap.add_argument("--jlens-mode", default="none", choices=["none", "wave8", "ablation", "hybrid", "hybrid_wave8_abl"])
     ap.add_argument("--jlens-weight", type=float, default=0.35)
     ap.add_argument("--jlens-horizons", type=int, default=8)
     ap.add_argument("--jlens-start-frac", type=float, default=0.0)
     ap.add_argument("--jlens-end-frac", type=float, default=1.0)
     ap.add_argument("--jlens-every", type=int, default=1, help="Apply J-Lens every N steps (reduces FLOP/time tax)")
     ap.add_argument("--jlens-upd-every", type=int, default=25)
+    # Hybrid Stage 1 (Low-FLOP Sparse Wave8 Multi-Horizon Lookahead Prior -> Stage 2 Causal-Ablation RL):
+    ap.add_argument("--hybrid-w8-weight", type=float, default=0.05)
+    ap.add_argument("--hybrid-w8-start-frac", type=float, default=0.0)
+    ap.add_argument("--hybrid-w8-end-frac", type=float, default=0.55)
+    ap.add_argument("--hybrid-w8-every", type=int, default=4)
+    ap.add_argument("--hybrid-w8-layers", type=str, default="", help="Optional comma-separated 1-indexed taps e.g. '3,5,7,9'")
+    ap.add_argument("--hybrid-w8-ema", type=float, default=0.90)
     # Phase 4 Causal-Ablation Workspace J-Lens flags:
     ap.add_argument("--abl-early-layer", type=int, default=3)
     ap.add_argument("--abl-anchor-layer", type=int, default=9)
@@ -170,17 +177,23 @@ def main():
     ap.add_argument("--abl-k", type=int, default=8)
     ap.add_argument("--abl-window", type=int, default=4)
     ap.add_argument("--abl-max-cosine", type=float, default=0.85)
+    ap.add_argument("--abl-select-mode", default="greedy_cos", choices=["greedy_cos", "maxmin", "kmeans", "emeans"])
     ap.add_argument("--abl-strength", type=float, default=1.0)
     ap.add_argument("--abl-match-norm", type=int, default=1)
     ap.add_argument("--abl-metric", default="cov", choices=["cov", "euclidean"])
     ap.add_argument("--abl-loss-kind", default="superpos_unlikelihood", choices=["superpos_unlikelihood", "unlikelihood", "signed_raw", "exp_signed_clamped"])
     ap.add_argument("--abl-exp-beta", type=float, default=0.0)
     ap.add_argument("--abl-exp-norm", type=int, default=1)
+    ap.add_argument("--abl-bystander-tau", type=float, default=0.0)
+    ap.add_argument("--abl-bystander-w", type=float, default=0.0)
     ap.add_argument("--abl-coalition-norm", type=int, default=1)
+    ap.add_argument("--abl-gamma-max", type=float, default=4.0)
     ap.add_argument("--abl-hop-norm", type=int, default=1)
     ap.add_argument("--abl-enable-early", type=int, default=1)
     ap.add_argument("--abl-layer-mode", default="fixed", choices=["fixed", "random_gap4", "random_anc_7_10"])
     ap.add_argument("--abl-pos-mode", default="hard_easy", choices=["hard_easy", "uniform"])
+    ap.add_argument("--abl-nll-cap", type=float, default=0.0)
+    ap.add_argument("--abl-live-target-head", type=int, default=0)
     ap.add_argument("--abl-detach-prev", type=int, default=0)
     ap.add_argument("--abl-ema", type=float, default=0.50)
     ap.add_argument("--opt", default="muon", choices=["muon", "adamw"])
@@ -229,10 +242,13 @@ def main():
     n_tot, n_trunk, flops_tok = raw_model.count_params_and_flops()
     fwd_model = torch.compile(raw_model, mode=args.compile_mode) if args.compile else raw_model
 
-    use_jlens = args.jlens_mode in ("wave8", "ablation")
+    is_hybrid = args.jlens_mode in ("hybrid", "hybrid_wave8_abl")
+    use_jlens = args.jlens_mode in ("wave8", "ablation") or is_hybrid
+    w8_tap_layers = [int(x) for x in args.hybrid_w8_layers.split(",") if x.strip()] if args.hybrid_w8_layers.strip() else None
     jlens_ctrl = None
-    if args.jlens_mode == "wave8":
-        jlens_ctrl = Wave8SteinJLensController(
+    w8_ctrl = None
+    if args.jlens_mode == "wave8" or is_hybrid:
+        w8_ctrl = Wave8SteinJLensController(
             n_layers=cfg.n_layers,
             d_model=cfg.d_model,
             vocab_pad=cfg.vocab_pad,
@@ -240,9 +256,13 @@ def main():
             device=device,
             unigram_path=data_dir / "unigram_counts_50432.npy",
             horizons=args.jlens_horizons,
+            ema=args.hybrid_w8_ema if is_hybrid else 0.90,
             softcap=cfg.softcap,
+            layer_indices=w8_tap_layers if is_hybrid else None,
         )
-    elif args.jlens_mode == "ablation":
+        if args.jlens_mode == "wave8":
+            jlens_ctrl = w8_ctrl
+    if args.jlens_mode == "ablation" or is_hybrid:
         jlens_ctrl = CausalAblationJLensController(
             raw_model=raw_model,
             device=device,
@@ -254,17 +274,23 @@ def main():
             k_dirs=args.abl_k,
             window=args.abl_window,
             max_cosine=args.abl_max_cosine,
+            select_mode=args.abl_select_mode,
             strength=args.abl_strength,
             match_norm=bool(args.abl_match_norm),
             metric=args.abl_metric,
             loss_kind=args.abl_loss_kind,
             exp_beta=args.abl_exp_beta,
             exp_norm=bool(args.abl_exp_norm),
+            bystander_tau=args.abl_bystander_tau,
+            bystander_w=args.abl_bystander_w,
             coalition_norm=bool(args.abl_coalition_norm),
+            gamma_max=args.abl_gamma_max,
             hop_norm=bool(args.abl_hop_norm),
             enable_early=bool(args.abl_enable_early),
             layer_mode=args.abl_layer_mode,
             pos_mode=args.abl_pos_mode,
+            nll_cap=args.abl_nll_cap,
+            live_target_head=bool(args.abl_live_target_head),
             detach_prev=bool(args.abl_detach_prev),
             ema=args.abl_ema,
             seed=args.seed,
@@ -279,7 +305,7 @@ def main():
     sha7   = os.environ.get("GIT_COMMIT_SHA", "local")[:7]
     log_p  = Path(args.log_dir) / f"{run_id}_{sha7}.jsonl.gz"
     abl_meta = {}
-    if args.jlens_mode == "ablation":
+    if args.jlens_mode == "ablation" or is_hybrid:
         if args.abl_layer_mode == "random_gap4":
             layers_desc = "random_gap4(2..6->6..10)"
         elif args.abl_layer_mode == "random_anc_7_10":
@@ -293,13 +319,27 @@ def main():
             "abl_probe_seqs": args.abl_probe_seqs,
             "abl_k": args.abl_k,
             "abl_window": args.abl_window,
+            "abl_select_mode": args.abl_select_mode,
             "abl_metric": args.abl_metric,
             "abl_loss_kind": args.abl_loss_kind,
             "abl_exp_beta": args.abl_exp_beta,
+            "abl_bystander_tau": args.abl_bystander_tau,
+            "abl_bystander_w": args.abl_bystander_w,
+            "abl_gamma_max": args.abl_gamma_max,
+            "abl_nll_cap": args.abl_nll_cap,
+            "abl_live_target_head": args.abl_live_target_head,
             "abl_coalition_norm": args.abl_coalition_norm,
             "abl_hop_norm": args.abl_hop_norm,
             "jlens_every": args.jlens_every,
         }
+        if is_hybrid:
+            abl_meta.update({
+                "hybrid_w8_weight": args.hybrid_w8_weight,
+                "hybrid_w8_start_frac": args.hybrid_w8_start_frac,
+                "hybrid_w8_end_frac": args.hybrid_w8_end_frac,
+                "hybrid_w8_every": args.hybrid_w8_every,
+                "hybrid_w8_layers": w8_ctrl.tap_layers,
+            })
     logger = CompressedJSONLLogger(log_p, {
         "kind": "train_70m",
         "n_params": n_tot,
@@ -309,7 +349,7 @@ def main():
         "fp8_block_k": args.fp8_block_k,
         "jlens_mode": args.jlens_mode,
         "jlens_weight": args.jlens_weight if use_jlens else 0.0,
-        "jlens_horizons": args.jlens_horizons if args.jlens_mode == "wave8" else 0,
+        "jlens_horizons": args.jlens_horizons if (args.jlens_mode == "wave8" or is_hybrid) else 0,
         "jlens_start_frac": args.jlens_start_frac if use_jlens else 0.0,
         "jlens_end_frac": args.jlens_end_frac if use_jlens else 1.0,
         "opt": args.opt,
@@ -326,12 +366,15 @@ def main():
     stable_end = int(args.steps * 0.80)
     j_start    = int(args.steps * args.jlens_start_frac)
     j_end      = int(args.steps * args.jlens_end_frac)
+    w8_start   = int(args.steps * args.hybrid_w8_start_frac)
+    w8_end     = int(args.steps * args.hybrid_w8_end_frac)
     t_win = time.perf_counter()
     last_s = 0
     steady_ms = []
     extra_jlens_flops_tot = 0.0
     jlens_active_steps = 0
     last_jlens_upd_step = -10**9
+    last_w8_upd_step    = -10**9
 
     for step in range(1, args.steps + 1):
         if step < args.warmup:
@@ -343,39 +386,95 @@ def main():
             lr_m  = 0.05 + 0.95 * w_cos
             j_cos = w_cos
 
+        ramp_steps = max(50, int(round(0.025 * args.steps)))
         if args.jlens_start_frac > 0.0 or args.jlens_end_frac < 1.0:
             eff_start = max(args.warmup if args.jlens_start_frac == 0.0 else j_start, 0)
             if step < j_start or step >= j_end:
                 j_cos = 0.0
-            elif args.jlens_start_frac > 0.0 and step < j_start + 50:
-                # Smooth 50-step ramp-in once entering log-log regime
-                j_cos = 0.5 * (1.0 - math.cos(math.pi * (step - j_start + 1) / 50.0))
+            elif args.jlens_start_frac > 0.0 and step < j_start + ramp_steps:
+                # Smooth 2.5%-horizon ramp-in once entering log-log regime (50 steps at 2000st, 380 steps at 15200st)
+                j_cos = 0.5 * (1.0 - math.cos(math.pi * (step - j_start + 1) / float(ramp_steps)))
             elif step <= eff_start:
                 j_cos = 1.0
             else:
                 j_cos = 0.5 * (1.0 + math.cos(math.pi * (step - eff_start) / max(1, j_end - eff_start)))
 
+        w8_cos = 0.0
+        if is_hybrid:
+            eff_w8_start = max(args.warmup if args.hybrid_w8_start_frac == 0.0 else w8_start, 0)
+            if step < w8_start or step >= w8_end:
+                w8_cos = 0.0
+            elif args.hybrid_w8_start_frac > 0.0 and step < w8_start + ramp_steps:
+                w8_cos = 0.5 * (1.0 - math.cos(math.pi * (step - w8_start + 1) / float(ramp_steps)))
+            elif step <= eff_w8_start:
+                w8_cos = 1.0
+            else:
+                w8_cos = 0.5 * (1.0 + math.cos(math.pi * (step - eff_w8_start) / max(1, w8_end - eff_w8_start)))
+
         cadence_ok   = ((step - max(1, j_start)) % max(1, args.jlens_every) == 0)
         active_jlens = use_jlens and (j_cos > 1e-6) and cadence_ok
+        cadence_w8   = (step == 1) or ((step % max(1, args.hybrid_w8_every)) == 0)
+        active_w8    = is_hybrid and (w8_cos > 1e-6) and cadence_w8
         prewarm_snap = (
-            args.jlens_mode == "ablation"
+            (args.jlens_mode == "ablation" or is_hybrid)
             and j_start > 0
             and step in (max(1, j_start - args.jlens_upd_every), max(1, j_start - 1))
         )
 
         opt.zero_grad()
-        ce_sum, jl_sum = 0.0, 0.0
+        ce_sum, jl_sum, w8_sum = 0.0, 0.0, 0.0
         abl_stats_last = None
-        cand_ids = jlens_ctrl.sample_vocab_candidates() if (active_jlens and args.jlens_mode == "wave8") else None
-        if active_jlens:
+        need_w8_cand = (active_jlens and args.jlens_mode == "wave8") or active_w8
+        cand_ids = w8_ctrl.sample_vocab_candidates() if need_w8_cand else None
+        if active_jlens or active_w8:
             jlens_active_steps += 1
 
         for micro_i in range(grad_accum):
             xb, yb = stream.next_batch(device)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                if active_jlens and args.jlens_mode == "wave8":
+                if is_hybrid and (active_w8 or active_jlens):
                     ce_loss, tok_nll, interm, x_raw = fwd_model(xb, yb, return_interm=True)
-                    if micro_i == 0 and (step == 1 or (step - last_jlens_upd_step) >= args.jlens_upd_every):
+                    interm_det = None
+                    tot_loss = ce_loss
+                    if active_w8:
+                        did_w8_ref = (micro_i == 0) and (step == 1 or (step - last_w8_upd_step) >= args.jlens_upd_every)
+                        if did_w8_ref:
+                            interm_det = [t.detach() for t in interm]
+                            w8_ctrl.refresh_lenses(interm_det, x_raw, yb)
+                            last_w8_upd_step = step
+                        w8_loss, w8_obs = w8_ctrl.compute_loss(
+                            interm, raw_model.out_norm.weight, raw_model.tok_emb.weight, yb, tok_nll, cand_ids
+                        )
+                        anchor = (ce_loss.detach() / w8_obs.clamp_min(1e-4)).clamp(0.20, 1.0)
+                        tot_loss = tot_loss + (args.hybrid_w8_weight * w8_cos * anchor) * w8_loss
+                        w8_sum += float(w8_obs.item()) / grad_accum
+                        extra_jlens_flops_tot += w8_ctrl.estimate_call_flops(did_refresh=did_w8_ref)
+                    if active_jlens:
+                        did_abl_ref = (micro_i == 0) and (not jlens_ctrl._initialized or (step - last_jlens_upd_step) >= args.jlens_upd_every)
+                        if did_abl_ref:
+                            if interm_det is None:
+                                interm_det = [t.detach() for t in interm]
+                            jlens_ctrl.refresh_snapshot(raw_model, interm_det, x_raw)
+                            last_jlens_upd_step = step
+                        j_loss, j_obs, abl_stats_last = jlens_ctrl.compute_loss(raw_model, interm, yb, tok_nll)
+                        tot_loss = tot_loss + (args.jlens_weight * j_cos) * j_loss
+                        jl_sum += float(j_obs.item()) / grad_accum
+                        extra_jlens_flops_tot += jlens_ctrl.estimate_call_flops(
+                            args.micro_batch,
+                            abl_stats_last["n_act"],
+                            abl_stats_last["n_seqs"],
+                            abl_stats_last["l_ear"],
+                            abl_stats_last["l_anc"],
+                        )
+                    elif prewarm_snap and micro_i == 0:
+                        if interm_det is None:
+                            interm_det = [t.detach() for t in interm]
+                        jlens_ctrl.refresh_snapshot(raw_model, interm_det, x_raw)
+                        last_jlens_upd_step = step
+                elif active_jlens and args.jlens_mode == "wave8":
+                    ce_loss, tok_nll, interm, x_raw = fwd_model(xb, yb, return_interm=True)
+                    did_w8_ref = (micro_i == 0) and (step == 1 or (step - last_jlens_upd_step) >= args.jlens_upd_every)
+                    if did_w8_ref:
                         jlens_ctrl.refresh_lenses([t.detach() for t in interm], x_raw, yb)
                         last_jlens_upd_step = step
                     j_loss, j_obs = jlens_ctrl.compute_loss(
@@ -384,6 +483,7 @@ def main():
                     anchor = (ce_loss.detach() / j_obs.clamp_min(1e-4)).clamp(0.20, 1.0)
                     tot_loss = ce_loss + (args.jlens_weight * j_cos * anchor) * j_loss
                     jl_sum += float(j_obs.item()) / grad_accum
+                    extra_jlens_flops_tot += jlens_ctrl.estimate_call_flops(did_refresh=did_w8_ref)
                 elif active_jlens and args.jlens_mode == "ablation":
                     ce_loss, tok_nll, interm, x_raw = fwd_model(xb, yb, return_interm=True)
                     if micro_i == 0 and (not jlens_ctrl._initialized or (step - last_jlens_upd_step) >= args.jlens_upd_every):
@@ -432,6 +532,9 @@ def main():
             if use_jlens:
                 rec["jlens_ce"] = round(jl_sum, 4)
                 rec["j_cos"] = round(j_cos, 3)
+            if is_hybrid:
+                rec["w8_ce"] = round(w8_sum, 4)
+                rec["w8_cos"] = round(w8_cos, 3)
             if abl_stats_last is not None:
                 rec.update(abl_stats_last)
             if do_eval:
@@ -439,9 +542,10 @@ def main():
                 rec["val_ce"] = round(v_ce, 4)
             logger.write(rec)
             v_str = f" | val={rec['val_ce']:.4f}" if "val_ce" in rec else ""
+            w8_str = f" | w8={w8_sum:.3f}({w8_cos:.2f})" if is_hybrid and w8_cos > 1e-6 else ""
             j_str = f" | jce={jl_sum:.4f}" if use_jlens else ""
             u_str = f" | |uA|={abl_stats_last['u_anc_abs']:.4f}" if abl_stats_last is not None else ""
-            print(f"[{run_id}] st {step:4d}/{args.steps} | ce={ce_sum:.4f}{j_str}{u_str}{v_str} | gn={gnorm:.2f} | {ms_st:.1f}ms/st ({tok_s/1e3:.0f}k tok/s, {tflops:.0f} TF)", flush=True)
+            print(f"[{run_id}] st {step:4d}/{args.steps} | ce={ce_sum:.4f}{w8_str}{j_str}{u_str}{v_str} | gn={gnorm:.2f} | {ms_st:.1f}ms/st ({tok_s/1e3:.0f}k tok/s, {tflops:.0f} TF)", flush=True)
             t_win = time.perf_counter(); last_s = step
 
     full_val = evaluate_val(raw_model, val_arr, eval_tokens=10_485_760, batch_size=min(64, args.micro_batch), device=device)
