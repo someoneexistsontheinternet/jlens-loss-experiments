@@ -20,7 +20,7 @@ from ultra_probe_kernels import advance_local_window_kv_ultra
 from jlens_wave8 import Wave8SteinJLensController
 from jlens_ablation import (
     FrozenSoftcapReadout, WorkspaceJLens, select_diverse_fast, select_diverse_from_pool,
-    suppress_oblique_single_and_joint, compute_feature_loss, calibrate_usefulness,
+    suppress_oblique_single_and_joint, compute_feature_loss, compute_feature_loss_pregathered, calibrate_usefulness,
     extract_clean_kv_for_blocks, advance_local_window_kv, _compiled_cluster_select_indices,
     CausalAblationJLensController,
 )
