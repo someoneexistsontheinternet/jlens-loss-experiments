@@ -17,8 +17,13 @@ def main():
     t0 = time.time()
     while True:
         try:
-            out = subprocess.check_output([FLS_BIN, "runjob", "list", "--json"], text=True)
-            items = json.loads(out).get("items", [])
+            items = []
+            for pg in (1, 2, 3):
+                out = subprocess.check_output([FLS_BIN, "runjob", "list", "--page", str(pg), "--json"], text=True)
+                pg_items = json.loads(out).get("items", [])
+                items.extend(pg_items)
+                if len(pg_items) < 20:
+                    break
         except Exception as e:
             print(f"[wait_wave] transient list error: {e}", flush=True)
             time.sleep(poll_s)
