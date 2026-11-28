@@ -7,16 +7,19 @@ Targeted mathematical & systems verification suite for `src/jlens_ablation.py` o
   4. Verifies end-to-end `CausalAblationJLensController` stops early probes at `anchor_layer` (never executing suffix blocks!) and leaves frozen readout grad-free.
 """
 import sys
+import time
 from pathlib import Path
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from model_70m import NanoGPT70MConfig, NanoGPT70M
+from jlens_wave8 import Wave8SteinJLensController
 from jlens_ablation import (
-    FrozenSoftcapReadout, WorkspaceJLens, select_diverse_fast,
-    suppress_oblique_single_and_joint, compute_feature_loss,
-    extract_clean_kv_for_blocks, advance_local_window_kv,
+    FrozenSoftcapReadout, WorkspaceJLens, select_diverse_fast, select_diverse_from_pool,
+    suppress_oblique_single_and_joint, compute_feature_loss, calibrate_usefulness,
+    extract_clean_kv_for_blocks, advance_local_window_kv, _compiled_cluster_select_indices,
     CausalAblationJLensController,
 )
 
@@ -271,7 +274,6 @@ def main():
     print(f"PASS 10: Verified `exp_signed_clamped` (q=0.01 grad={z_esc.grad[0,0].item():.4f}, log_q<-9 grad=0.0) & `random_anc_7_10` (sampled={st_ra['l_anc']})")
 
     # 11. Verify Fused Hybrid (`Wave8SteinJLensController` sparse taps + `CausalAblationJLensController` sharing ONE `interm` pass):
-    from jlens_wave8 import Wave8SteinJLensController
     cfg_hyb = NanoGPT70MConfig(n_layers=12, d_model=64, n_heads=2, head_dim=32, d_ff=128, vocab_pad=512, seq_len=256, ce_backend="eager")
     m_hyb = NanoGPT70M(cfg_hyb).to(device).train()
     w8_full = Wave8SteinJLensController(
@@ -302,8 +304,6 @@ def main():
     print(f"PASS 11: Verified Hybrid `Wave8 + CausalAblation` shared-interm fwd+bwd (w8={loss_w8.item():.4f}, abl={loss_ab.item():.5f}, sparse_ratio=0.40)")
 
     # 12. Verify `maxmin`, `kmeans`, and `emeans` (threshold-free clustering, synonym collapse, rival surfacing, 100% k slots, GPU speed):
-    import time
-    from jlens_ablation import FrozenSoftcapReadout, WorkspaceJLens
     V_syn, D_syn = 64, 32
     U_syn = torch.zeros((V_syn, D_syn), dtype=torch.float32, device=device)
     g_syn = torch.Generator(device="cpu").manual_seed(777)
@@ -355,7 +355,6 @@ def main():
 
     speed_msg = ""
     if device.type == "cuda":
-        from jlens_ablation import _compiled_cluster_select_indices
         u_bench = F.normalize(torch.randn((1311, 64, 64), device=device), dim=-1)
         G_bench = torch.bmm(u_bench, u_bench.transpose(-1, -2)).clamp(-1.0, 1.0)
         p_bench = F.softmax(torch.randn((1311, 64), device=device), dim=-1)
@@ -374,7 +373,6 @@ def main():
     print(f"PASS 12: Verified `maxmin`, `kmeans`, `emeans` (8/8 distinct slots, 50->1 synonym collapse + 7/7 rivals;{speed_msg})")
 
     # 13. Verify Bystander Eviction + SNR Cleanups (`gamma_max=1.0`, `bystander_tau/w` monotonicity, `live_target_head=1`, `nll_cap`):
-    from jlens_ablation import calibrate_usefulness
     raw_u_g = torch.tensor([[0.03, 0.02, 0.01, 0.02]], device=device)
     u_all_g = torch.tensor([1.0], device=device)
     val_g   = torch.ones_like(raw_u_g, dtype=torch.bool)
