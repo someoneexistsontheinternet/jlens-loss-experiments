@@ -177,6 +177,7 @@ def main():
     ap.add_argument("--abl-coalition-norm", type=int, default=1)
     ap.add_argument("--abl-hop-norm", type=int, default=1)
     ap.add_argument("--abl-enable-early", type=int, default=1)
+    ap.add_argument("--abl-layer-mode", default="fixed", choices=["fixed", "random_gap4"])
     ap.add_argument("--abl-pos-mode", default="hard_easy", choices=["hard_easy", "uniform"])
     ap.add_argument("--abl-detach-prev", type=int, default=0)
     ap.add_argument("--abl-ema", type=float, default=0.50)
@@ -194,13 +195,14 @@ def main():
     ap.add_argument("--compile", type=int, default=1)
     ap.add_argument("--compile-mode", default="default")
     ap.add_argument("--ce-backend", default="triton", choices=["triton", "eager"])
-    ap.add_argument("--ce-chunk-sz", type=int, default=4096)
+    ap.add_argument("--ce-chunk-sz", type=int, default=16384)
     ap.add_argument("--fused-block-ops", type=int, default=1)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
     device = torch.device("cuda")
     torch.manual_seed(args.seed)
+    torch.set_float32_matmul_precision("high")
     torch._dynamo.config.cache_size_limit = 64
 
     data_dir = Path(args.data_dir)
@@ -257,9 +259,11 @@ def main():
             coalition_norm=bool(args.abl_coalition_norm),
             hop_norm=bool(args.abl_hop_norm),
             enable_early=bool(args.abl_enable_early),
+            layer_mode=args.abl_layer_mode,
             pos_mode=args.abl_pos_mode,
             detach_prev=bool(args.abl_detach_prev),
             ema=args.abl_ema,
+            seed=args.seed,
         )
 
     grad_accum = max(1, args.batch_tokens // (args.micro_batch * args.seq_len))
@@ -272,8 +276,13 @@ def main():
     log_p  = Path(args.log_dir) / f"{run_id}_{sha7}.jsonl.gz"
     abl_meta = {}
     if args.jlens_mode == "ablation":
+        layers_desc = (
+            "random_gap4(2..6->6..10)" if args.abl_layer_mode == "random_gap4"
+            else (f"{args.abl_early_layer}->{args.abl_anchor_layer}" if args.abl_enable_early else f"anc{args.abl_anchor_layer}")
+        )
         abl_meta = {
-            "abl_layers": f"{args.abl_early_layer}->{args.abl_anchor_layer}" if args.abl_enable_early else f"anc{args.abl_anchor_layer}",
+            "abl_layers": layers_desc,
+            "abl_layer_mode": args.abl_layer_mode,
             "abl_active_frac": args.abl_active_frac,
             "abl_probe_seqs": args.abl_probe_seqs,
             "abl_k": args.abl_k,
@@ -377,7 +386,11 @@ def main():
                     tot_loss = ce_loss + (args.jlens_weight * j_cos) * j_loss
                     jl_sum += float(j_obs.item()) / grad_accum
                     extra_jlens_flops_tot += jlens_ctrl.estimate_call_flops(
-                        args.micro_batch, abl_stats_last["n_act"], abl_stats_last["n_seqs"]
+                        args.micro_batch,
+                        abl_stats_last["n_act"],
+                        abl_stats_last["n_seqs"],
+                        abl_stats_last["l_ear"],
+                        abl_stats_last["l_anc"],
                     )
                 elif prewarm_snap and micro_i == 0:
                     ce_loss, _, interm, x_raw = fwd_model(xb, yb, return_interm=True)

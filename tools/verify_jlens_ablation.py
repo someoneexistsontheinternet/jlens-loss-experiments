@@ -221,6 +221,24 @@ def main():
     rad_dot = float((x_s1.grad * x_s1.detach()).sum(dim=-1).abs().max().item())
     assert rad_dot < 1e-4, f"Expected tangential grad (<grad, x> == 0), got {rad_dot}"
     print(f"PASS 8: Verified 1/(B*T) nat normalization, matched J/U EMA={ctrl_mp.ema} (dU={u_delta:.4f}), and RMSNorm sink-invariance (rad_dot={rad_dot:.2e})")
+
+    # 9. Verify `random_gap4` layer_mode on 12-layer config (exact 15 valid pairs, batched 9-layer Cholesky refresh, finite grad):
+    cfg12 = NanoGPT70MConfig(n_layers=12, d_model=64, n_heads=2, head_dim=32, d_ff=128, vocab_pad=512, seq_len=32, ce_backend="eager")
+    m12 = NanoGPT70M(cfg12).to(device).train()
+    ctrl_rg = CausalAblationJLensController(m12, device=device, layer_mode="random_gap4", active_frac=0.10, k_dirs=4, window=4)
+    assert len(ctrl_rg.valid_layer_pairs) == 15 and all((la - le) >= 4 and 2 <= le <= 6 and 6 <= la <= 10 for le, la in ctrl_rg.valid_layer_pairs)
+    xb12 = torch.randint(0, 500, (2, 32), device=device)
+    yb12 = torch.randint(0, 500, (2, 32), device=device)
+    m12.zero_grad(set_to_none=True)
+    ce12, nll12, int12, xraw12 = m12(xb12, yb12, return_interm=True)
+    ctrl_rg.refresh_snapshot(m12, [t.detach() for t in int12], xraw12)
+    seen_pairs = set()
+    for _ in range(6):
+        aux12, _, st12 = ctrl_rg.compute_loss(m12, int12, yb12, nll12)
+        seen_pairs.add((st12["l_ear"], st12["l_anc"]))
+    (ce12 + 0.50 * aux12).backward()
+    assert len(seen_pairs) >= 2 and torch.isfinite(aux12)
+    print(f"PASS 9: Verified `random_gap4` (15 valid pairs, 9-layer batched Stein refresh, sampled={sorted(seen_pairs)})")
     print("ALL VERIFICATION CHECKS PASSED.")
 
 
