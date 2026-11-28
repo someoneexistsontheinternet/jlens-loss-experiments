@@ -173,11 +173,13 @@ def main():
     ap.add_argument("--abl-strength", type=float, default=1.0)
     ap.add_argument("--abl-match-norm", type=int, default=1)
     ap.add_argument("--abl-metric", default="cov", choices=["cov", "euclidean"])
-    ap.add_argument("--abl-loss-kind", default="superpos_unlikelihood", choices=["superpos_unlikelihood", "unlikelihood", "signed_raw"])
+    ap.add_argument("--abl-loss-kind", default="superpos_unlikelihood", choices=["superpos_unlikelihood", "unlikelihood", "signed_raw", "exp_signed_clamped"])
+    ap.add_argument("--abl-exp-beta", type=float, default=0.0)
+    ap.add_argument("--abl-exp-norm", type=int, default=1)
     ap.add_argument("--abl-coalition-norm", type=int, default=1)
     ap.add_argument("--abl-hop-norm", type=int, default=1)
     ap.add_argument("--abl-enable-early", type=int, default=1)
-    ap.add_argument("--abl-layer-mode", default="fixed", choices=["fixed", "random_gap4"])
+    ap.add_argument("--abl-layer-mode", default="fixed", choices=["fixed", "random_gap4", "random_anc_7_10"])
     ap.add_argument("--abl-pos-mode", default="hard_easy", choices=["hard_easy", "uniform"])
     ap.add_argument("--abl-detach-prev", type=int, default=0)
     ap.add_argument("--abl-ema", type=float, default=0.50)
@@ -256,6 +258,8 @@ def main():
             match_norm=bool(args.abl_match_norm),
             metric=args.abl_metric,
             loss_kind=args.abl_loss_kind,
+            exp_beta=args.abl_exp_beta,
+            exp_norm=bool(args.abl_exp_norm),
             coalition_norm=bool(args.abl_coalition_norm),
             hop_norm=bool(args.abl_hop_norm),
             enable_early=bool(args.abl_enable_early),
@@ -276,10 +280,12 @@ def main():
     log_p  = Path(args.log_dir) / f"{run_id}_{sha7}.jsonl.gz"
     abl_meta = {}
     if args.jlens_mode == "ablation":
-        layers_desc = (
-            "random_gap4(2..6->6..10)" if args.abl_layer_mode == "random_gap4"
-            else (f"{args.abl_early_layer}->{args.abl_anchor_layer}" if args.abl_enable_early else f"anc{args.abl_anchor_layer}")
-        )
+        if args.abl_layer_mode == "random_gap4":
+            layers_desc = "random_gap4(2..6->6..10)"
+        elif args.abl_layer_mode == "random_anc_7_10":
+            layers_desc = "rand_anc(7..10)" if not args.abl_enable_early else f"{args.abl_early_layer}->rand(7..10)"
+        else:
+            layers_desc = f"{args.abl_early_layer}->{args.abl_anchor_layer}" if args.abl_enable_early else f"anc{args.abl_anchor_layer}"
         abl_meta = {
             "abl_layers": layers_desc,
             "abl_layer_mode": args.abl_layer_mode,
@@ -289,6 +295,7 @@ def main():
             "abl_window": args.abl_window,
             "abl_metric": args.abl_metric,
             "abl_loss_kind": args.abl_loss_kind,
+            "abl_exp_beta": args.abl_exp_beta,
             "abl_coalition_norm": args.abl_coalition_norm,
             "abl_hop_norm": args.abl_hop_norm,
             "jlens_every": args.jlens_every,

@@ -239,6 +239,36 @@ def main():
     (ce12 + 0.50 * aux12).backward()
     assert len(seen_pairs) >= 2 and torch.isfinite(aux12)
     print(f"PASS 9: Verified `random_gap4` (15 valid pairs, 9-layer batched Stein refresh, sampled={sorted(seen_pairs)})")
+
+    # 10. Verify `exp_signed_clamped` (beta in {0, 6, 12}: full -(1-q) negative suppression at q=0.01, zero grad below log_q=-9.0) + `random_anc_7_10`:
+    z_esc = torch.tensor([[-4.60517, 0.0]], device=device, requires_grad=True)  # q_0 ~ 0.01
+    l_esc = compute_feature_loss(
+        z_esc.log_softmax(-1), torch.tensor([[0]], device=device),
+        torch.tensor([[-0.30]], device=device), torch.tensor([[True]], device=device),
+        loss_kind="exp_signed_clamped", exp_beta=6.0,
+    ).sum()
+    l_esc.backward()
+    # At q_0 ~ 0.01, dL/dz_0 must be ~ +0.30 * (1 - 0.01) ~ +0.297 (>100x stronger than unlikelihood's +0.003!):
+    assert float(z_esc.grad[0, 0].item()) > 0.25, f"Expected full -(1-q) negative suppression grad > 0.25, got {z_esc.grad[0, 0].item()}"
+
+    z_dead = torch.tensor([[-12.0, 0.0]], device=device, requires_grad=True)   # log_q < -9.0 -> clamped to zero grad!
+    l_dead = compute_feature_loss(
+        z_dead.log_softmax(-1), torch.tensor([[0]], device=device),
+        torch.tensor([[-0.50]], device=device), torch.tensor([[True]], device=device),
+        loss_kind="exp_signed_clamped", exp_beta=12.0,
+    ).sum()
+    l_dead.backward()
+    assert torch.isfinite(l_dead) and abs(float(z_dead.grad[0, 0].item())) == 0.0
+
+    ctrl_ra = CausalAblationJLensController(
+        m12, device=device, enable_early=False, layer_mode="random_anc_7_10",
+        active_frac=0.10, k_dirs=4, window=1, loss_kind="exp_signed_clamped", exp_beta=6.0,
+    )
+    assert [la for _, la in ctrl_ra.valid_layer_pairs] == [7, 8, 9, 10]
+    ctrl_ra.refresh_snapshot(m12, [t.detach() for t in int12], xraw12)
+    aux_ra, _, st_ra = ctrl_ra.compute_loss(m12, int12, yb12, nll12)
+    assert st_ra["l_anc"] in (7, 8, 9, 10) and torch.isfinite(aux_ra)
+    print(f"PASS 10: Verified `exp_signed_clamped` (q=0.01 grad={z_esc.grad[0,0].item():.4f}, log_q<-9 grad=0.0) & `random_anc_7_10` (sampled={st_ra['l_anc']})")
     print("ALL VERIFICATION CHECKS PASSED.")
 
 

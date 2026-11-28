@@ -602,6 +602,8 @@ def compute_feature_loss_pregathered(
     weights: Tensor,
     valid: Tensor,
     loss_kind: str = "superpos_unlikelihood",
+    exp_beta: float = 0.0,
+    exp_norm: bool = True,
 ) -> Tensor:
     with torch.amp.autocast(device_type=lq_sel.device.type, enabled=False):
         w = torch.where(valid, weights.detach().float(), torch.zeros_like(weights, dtype=torch.float32))
@@ -609,6 +611,34 @@ def compute_feature_loss_pregathered(
 
         if loss_kind == "signed_raw":
             return -(w * lq_f).sum(dim=-1)
+
+        if loss_kind == "exp_signed_clamped":
+            u_c = torch.where(valid, w.clamp(-0.6, 0.6), torch.zeros_like(w))
+            if exp_beta > 0.0:
+                u_raw = torch.sign(u_c) * (torch.expm1(exp_beta * u_c.abs()) * (1.0 / exp_beta))
+                u_raw = torch.where(valid, u_raw, torch.zeros_like(u_raw))
+                if exp_norm:
+                    n_val = valid.float().sum().clamp_min(1.0)
+                    mean_c = u_c.abs().sum() / n_val
+                    mean_r = u_raw.abs().sum() / n_val
+                    u_tilde = u_raw * (mean_c / mean_r.clamp_min(1e-8))
+                else:
+                    u_tilde = u_raw
+            else:
+                u_tilde = u_c
+
+            w_pos = F.relu(u_tilde)
+            w_neg = F.relu(-u_tilde)
+            q_sel = lq_f.exp().clamp(0.0, 1.0 - 1e-7)
+            pos_mask = (u_tilde > 0.0) & valid
+            sum_q_pos = (q_sel * pos_mask.float()).sum(dim=-1, keepdim=True)
+            q_bg = (1.0 - sum_q_pos).clamp_min(1e-6)
+            log_q_bg  = torch.log(q_bg)
+            log_p_ind = lq_f - torch.logaddexp(lq_f, log_q_bg.expand_as(lq_f))
+            pos_term  = -(w_pos * log_p_ind).sum(dim=-1)
+            # Full -(1 - q_i) suppression strength down to log_q = -9.0 (q ~ 1.23e-4), zero grad / zero -inf blowup below!
+            neg_term  = (w_neg * lq_f.clamp(min=-9.0)).sum(dim=-1)
+            return pos_term + neg_term
 
         w_pos = F.relu(w)
         w_neg = F.relu(-w)
@@ -634,9 +664,13 @@ def compute_feature_loss(
     weights: Tensor,
     valid: Tensor,
     loss_kind: str = "superpos_unlikelihood",
+    exp_beta: float = 0.0,
+    exp_norm: bool = True,
 ) -> Tensor:
     lq_sel = logq.float().gather(-1, ids)
-    return compute_feature_loss_pregathered(lq_sel, weights, valid, loss_kind=loss_kind)
+    return compute_feature_loss_pregathered(
+        lq_sel, weights, valid, loss_kind=loss_kind, exp_beta=exp_beta, exp_norm=exp_norm
+    )
 
 
 # ==============================================================================
@@ -808,6 +842,8 @@ class CausalAblationJLensController:
         match_norm: bool = True,
         metric: str = "cov",
         loss_kind: str = "superpos_unlikelihood",
+        exp_beta: float = 0.0,
+        exp_norm: bool = True,
         coalition_norm: bool = True,
         hop_norm: bool = True,
         enable_early: bool = True,
@@ -820,7 +856,7 @@ class CausalAblationJLensController:
         seed: int = 42,
     ):
         assert 1 <= early_layer < anchor_layer < raw_model.cfg.n_layers
-        assert layer_mode in ("fixed", "random_gap4")
+        assert layer_mode in ("fixed", "random_gap4", "random_anc_7_10")
         self.cfg            = raw_model.cfg
         self.device         = device
         self.early_layer    = early_layer
@@ -836,6 +872,8 @@ class CausalAblationJLensController:
         self.match_norm     = match_norm
         self.metric         = metric
         self.loss_kind      = loss_kind
+        self.exp_beta       = float(exp_beta)
+        self.exp_norm       = bool(exp_norm)
         self.coalition_norm = coalition_norm
         self.hop_norm       = hop_norm
         self.enable_early   = enable_early
@@ -864,6 +902,13 @@ class CausalAblationJLensController:
                     for la in range(2, self.cfg.n_layers) if (la - le) >= mg
                 ]
             tracked_layers = sorted({l for pr in self.valid_layer_pairs for l in pr} | {early_layer, anchor_layer})
+        elif layer_mode == "random_anc_7_10":
+            if self.cfg.n_layers >= 12:
+                anc_list = [7, 8, 9, 10]
+            else:
+                anc_list = list(range(max(2, early_layer + 1), self.cfg.n_layers))
+            self.valid_layer_pairs = [(early_layer, la) for la in anc_list]
+            tracked_layers = sorted(set(anc_list) | {early_layer, anchor_layer})
         else:
             self.valid_layer_pairs = [(early_layer, anchor_layer)]
             tracked_layers = sorted({early_layer, anchor_layer})
@@ -1070,7 +1115,7 @@ class CausalAblationJLensController:
         B_tot, T_tot = yb.shape
         inv_m_tot = 1.0 / float(B_tot * T_tot)  # Fix #1: true per-token nat parity across all % active rungs!
 
-        if self.layer_mode == "random_gap4":
+        if self.layer_mode in ("random_gap4", "random_anc_7_10"):
             p_idx = int(torch.randint(0, len(self.valid_layer_pairs), (1,), generator=self.pair_rng).item())
             cur_ear, cur_anc = self.valid_layer_pairs[p_idx]
         else:
@@ -1152,7 +1197,9 @@ class CausalAblationJLensController:
             del kv_anc
 
         lq_sel_anc     = lens_anc.selected_log_probs(x_anc_live, ids_a)
-        vec_anc        = compute_feature_loss_pregathered(lq_sel_anc, u_anc, usable_a, loss_kind=self.loss_kind)
+        vec_anc        = compute_feature_loss_pregathered(
+            lq_sel_anc, u_anc, usable_a, loss_kind=self.loss_kind, exp_beta=self.exp_beta, exp_norm=self.exp_norm
+        )
         loss_anc_mean  = vec_anc.mean()
         loss_anc_batch = vec_anc.sum() * inv_m_tot
 
@@ -1203,7 +1250,9 @@ class CausalAblationJLensController:
                     ut_c   = u_anc_target[s:e].unsqueeze(1).expand(nc, P, k).reshape(nc * P, k)
                     usa_ac = usable_a[s:e].unsqueeze(1).expand(nc, P, k).reshape(nc * P, k)
                     lq_ec  = self.readout.fast_nograd_selected_logprobs(at_anc_h, ids_ac)
-                    sc_ec  = compute_feature_loss_pregathered(lq_ec, ut_c, usa_ac, loss_kind=self.loss_kind).view(nc, P)
+                    sc_ec  = compute_feature_loss_pregathered(
+                        lq_ec, ut_c, usa_ac, loss_kind=self.loss_kind, exp_beta=self.exp_beta, exp_norm=self.exp_norm
+                    ).view(nc, P)
 
                     raw_u_ec = sc_ec[:, 1 : k + 1] - sc_ec[:, 0:1]
                     u_all_ec = sc_ec[:, k + 1] - sc_ec[:, 0]
@@ -1216,7 +1265,9 @@ class CausalAblationJLensController:
                 del kv_ear
 
             lq_sel_ear     = lens_ear.selected_log_probs(x_ear_live, ids_e)
-            vec_ear        = compute_feature_loss_pregathered(lq_sel_ear, u_ear, usable_e, loss_kind=self.loss_kind)
+            vec_ear        = compute_feature_loss_pregathered(
+                lq_sel_ear, u_ear, usable_e, loss_kind=self.loss_kind, exp_beta=self.exp_beta, exp_norm=self.exp_norm
+            )
             loss_ear_mean  = vec_ear.mean()
             loss_ear_batch = vec_ear.sum() * inv_m_tot
 
