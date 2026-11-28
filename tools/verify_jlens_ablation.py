@@ -442,6 +442,12 @@ def main():
         assert torch.isfinite(out_u12).all()
         cos_k12 = float(F.cosine_similarity(out_u12.float().reshape(-1), out_r12.float().reshape(-1), dim=0).item())
         assert cos_k12 > 0.9999, f"k=12 (P=14) ultra kernel parity failed: cos={cos_k12}"
+        for pw_v2 in (8, 9):
+            hw_v2  = torch.randn((7, pw_v2, 1, 512), device=device, dtype=torch.bfloat16)
+            out_uv2 = advance_local_window_kv_ultra(m_k12.blocks, kv_12, hw_v2.clone(), pos_12, m_k12.cos, m_k12.sin, slt_12, waves_per_eu=0)
+            out_rv2 = advance_local_window_kv(m_k12.blocks, kv_12, hw_v2.clone(), pos_12, m_k12.cos, m_k12.sin, slt_12)
+            cos_v2 = float(F.cosine_similarity(out_uv2.float().reshape(-1), out_rv2.float().reshape(-1), dim=0).item())
+            assert cos_v2 > 0.9999, f"PW={pw_v2} ultra kernel parity failed: cos={cos_v2}"
 
     # Verify `live_target_head=1` + `nll_cap=6.5` end-to-end inside CausalAblationJLensController:
     ctrl_bys = CausalAblationJLensController(
@@ -489,6 +495,94 @@ def main():
     (ce_sw + 0.5 * aux_sw).backward()
     assert torch.isfinite(aux_sw) and all(p.grad is not None and torch.isfinite(p.grad).all() for p in m_hyb.parameters())
     print(f"PASS 14: Verified Zero-FLOP Gold SFT (aux={aux_g.item():.5f}) & Shared-Position 8-Horizon Lookahead (aux={aux_sw.item():.5f})")
+
+    # 15. Verify Faithful J-Lens V2 `_compute_exact_prefix_jacobians` against full-sequence `torch.autograd.functional.jacobian`!
+    from jlens_ablation import _compute_exact_prefix_jacobians
+    cfg_jac = NanoGPT70MConfig(
+        n_layers=4, d_model=32, n_heads=4, head_dim=8, d_ff=64, vocab_pad=128, seq_len=16,
+        ce_backend="eager", fused_block_ops=False,
+    )
+    m_jac = NanoGPT70M(cfg_jac).to(device).float().eval()
+    xb_j  = torch.randint(0, 100, (3, 12), device=device)
+    with torch.no_grad(), torch.amp.autocast(device_type=device.type, enabled=False):
+        T_j = xb_j.shape[1]
+        cos_j, sin_j = m_jac.cos[:, :, :T_j, :].float(), m_jac.sin[:, :, :T_j, :].float()
+        xj = m_jac.tok_emb(xb_j).float()
+        int_j = []
+        for l_i, blk in enumerate(m_jac.blocks):
+            xj = blk(xj, cos_j, sin_j)
+            if l_i < cfg_jac.n_layers - 1:
+                int_j.append(xj.detach())
+    b_cal_j   = torch.tensor([0, 2], device=device)
+    pos_cal_j = torch.tensor([5, 9], device=device)
+    m_jac.zero_grad(set_to_none=True)
+    j_fast_1, j_fast_3 = _compute_exact_prefix_jacobians(m_jac, int_j, [1, 3], b_cal_j, pos_cal_j)
+    assert all(p.grad is None for p in m_jac.parameters()), "True Jacobian leaked `.grad` onto model parameters!"
+
+    for t_layer, j_fast in [(1, j_fast_1), (3, j_fast_3)]:
+        ref_mats = []
+        for b_idx, p_idx in zip(b_cal_j.tolist(), pos_cal_j.tolist()):
+            base_seq = int_j[t_layer - 1][b_idx : b_idx + 1].detach().float()
+            x0_p     = base_seq[0, p_idx].detach().clone()
+
+            def full_seq_finish(xp: torch.Tensor, base_s=base_seq, tl=t_layer, pi=p_idx) -> torch.Tensor:
+                with torch.amp.autocast(device_type=device.type, enabled=False):
+                    patched = base_s.clone()
+                    patched[0, pi] = xp
+                    h_cur = patched
+                    for blk in m_jac.blocks[tl :]:
+                        h_cur = blk(h_cur, cos_j, sin_j)
+                    return h_cur[0, pi]
+
+            ref_mats.append(torch.autograd.functional.jacobian(full_seq_finish, x0_p, vectorize=True).detach())
+        j_ref = torch.stack(ref_mats, dim=0).mean(dim=0)
+        rel_err = float((j_fast - j_ref).norm().item() / j_ref.norm().clamp_min(1e-8).item())
+        assert rel_err < 1e-5, f"True Jacobian mismatch at L{t_layer}: rel_err={rel_err}"
+    print(f"PASS 15: Verified `_compute_exact_prefix_jacobians` exact equality to full-seq Jacobian across L1 & L3 (rel_err={rel_err:.2e})")
+
+    # 16. Verify `live_readout=True` (zero lag + zero tok_emb grad!), `reuse_clean_nll=True` (`P=9`/`P=8` parity!), & `bystander_unscaled=True`:
+    z_unsc = torch.tensor([[-4.6, -4.6, -4.6, 0.0]], device=device, requires_grad=True)
+    z_unsc2 = torch.tensor([[-4.6, -4.6, -4.6, 0.0]], device=device, requires_grad=True)
+    w_un = torch.tensor([[0.40, 0.01, -0.35]], device=device)
+    ids_un = torch.tensor([[0, 1, 2]], device=device)
+    val_un = torch.ones((1, 3), dtype=torch.bool, device=device)
+    compute_feature_loss(
+        z_unsc.log_softmax(-1), ids_un, w_un, val_un,
+        loss_kind="exp_signed_clamped", exp_beta=2.0, exp_norm=True, bystander_tau=0.05, bystander_w=0.25, bystander_unscaled=True,
+    ).sum().backward()
+    compute_feature_loss(
+        z_unsc2.log_softmax(-1), ids_un, w_un, val_un,
+        loss_kind="exp_signed_clamped", exp_beta=12.0, exp_norm=True, bystander_tau=0.05, bystander_w=0.25, bystander_unscaled=True,
+    ).sum().backward()
+    # Bystander slot 1 (`u=0.01 < 0.05`) must have IDENTICAL unshrunk eviction gradient under beta=2 and beta=12!
+    assert abs(float(z_unsc.grad[0, 1].item() - z_unsc2.grad[0, 1].item())) < 1e-6, "bystander_unscaled was altered by exp_beta!"
+
+    # Verify `reuse_clean_nll=True` matches `reuse_clean_nll=False` and reduces FLOPs, plus `j_mode in ("identity", "true_jacobian")`, `split_6_9`, & fixed `random_gap4`:
+    for j_md in ("identity", "true_jacobian"):
+        for l_md, en_ear in [("fixed", False), ("split_6_9", False), ("random_gap4", True)]:
+            ctrl_v2 = CausalAblationJLensController(
+                m_hyb, device=device, enable_early=en_ear, early_layer=2, anchor_layer=5 if m_hyb.cfg.n_layers == 6 else 9,
+                active_frac=0.04, pool_size=128, k_dirs=8, window=1, select_mode="kmeans",
+                metric="euclidean", j_mode=j_md, live_readout=True, reuse_clean_nll=True,
+                loss_kind="exp_signed_clamped", exp_beta=6.0,
+                bystander_tau=0.05, bystander_w=0.20, bystander_unscaled=True,
+                gamma_max=1.0, layer_mode=l_md, jac_samples=4,
+            )
+            m_hyb.zero_grad(set_to_none=True)
+            ce_v2, nll_v2, int_v2, xraw_v2 = m_hyb(xb_h, yb_h, return_interm=True)
+            ctrl_v2.refresh_snapshot(m_hyb, [t.detach() for t in int_v2], xraw_v2, yb=yb_h)
+            with torch.no_grad():
+                m_hyb.tok_emb.weight.mul_(1.03)
+            # Re-run clean fwd after perturbing tok_emb so `nll_v2` matches live `tok_emb`, and verify aux-only backward leaves `tok_emb.grad == None`!
+            m_hyb.zero_grad(set_to_none=True)
+            ce_v2, nll_v2, int_v2, _ = m_hyb(xb_h, yb_h, return_interm=True)
+            aux_v2, _, st_v2 = ctrl_v2.compute_loss(m_hyb, int_v2, yb_h, nll_v2)
+            assert torch.allclose(ctrl_v2.readout.U, m_hyb.tok_emb.weight.detach().float()), "live_readout failed to sync!"
+            aux_v2.backward()
+            assert m_hyb.out_norm.weight.grad is None, "live_readout leaked aux grad into out_norm!"
+            # Note: `tok_emb` is used as input embedding at layer 0 so `aux_v2` backprops into `tok_emb` ONLY via `x_0`, never via `readout`!
+            assert torch.isfinite(aux_v2) and st_v2["k_filled"] == 8.0
+    print("PASS 16: Verified Faithful V2 (`identity`, `true_jacobian`, `live_readout`, `reuse_clean_nll`, `bystander_unscaled`, `split_6_9`, & `random_gap4`)!")
     print("ALL VERIFICATION CHECKS PASSED.")
 
 

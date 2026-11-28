@@ -181,16 +181,21 @@ def main():
     ap.add_argument("--abl-strength", type=float, default=1.0)
     ap.add_argument("--abl-match-norm", type=int, default=1)
     ap.add_argument("--abl-metric", default="cov", choices=["cov", "euclidean"])
+    ap.add_argument("--abl-j-mode", default="ols_norm", choices=["ols_norm", "identity", "true_jacobian"])
+    ap.add_argument("--abl-live-readout", type=int, default=0)
+    ap.add_argument("--abl-reuse-clean-nll", type=int, default=0)
+    ap.add_argument("--abl-jac-samples", type=int, default=16)
     ap.add_argument("--abl-loss-kind", default="superpos_unlikelihood", choices=["superpos_unlikelihood", "unlikelihood", "signed_raw", "exp_signed_clamped"])
     ap.add_argument("--abl-exp-beta", type=float, default=0.0)
     ap.add_argument("--abl-exp-norm", type=int, default=1)
     ap.add_argument("--abl-bystander-tau", type=float, default=0.0)
     ap.add_argument("--abl-bystander-w", type=float, default=0.0)
+    ap.add_argument("--abl-bystander-unscaled", type=int, default=0)
     ap.add_argument("--abl-coalition-norm", type=int, default=1)
     ap.add_argument("--abl-gamma-max", type=float, default=4.0)
     ap.add_argument("--abl-hop-norm", type=int, default=1)
     ap.add_argument("--abl-enable-early", type=int, default=1)
-    ap.add_argument("--abl-layer-mode", default="fixed", choices=["fixed", "random_gap4", "random_anc_7_10"])
+    ap.add_argument("--abl-layer-mode", default="fixed", choices=["fixed", "random_gap4", "random_anc_7_10", "split_6_9"])
     ap.add_argument("--abl-pos-mode", default="hard_easy", choices=["hard_easy", "uniform"])
     ap.add_argument("--abl-nll-cap", type=float, default=0.0)
     ap.add_argument("--abl-live-target-head", type=int, default=0)
@@ -281,11 +286,15 @@ def main():
             strength=args.abl_strength,
             match_norm=bool(args.abl_match_norm),
             metric=args.abl_metric,
+            j_mode=args.abl_j_mode,
+            live_readout=bool(args.abl_live_readout),
+            reuse_clean_nll=bool(args.abl_reuse_clean_nll),
             loss_kind=args.abl_loss_kind,
             exp_beta=args.abl_exp_beta,
             exp_norm=bool(args.abl_exp_norm),
             bystander_tau=args.abl_bystander_tau,
             bystander_w=args.abl_bystander_w,
+            bystander_unscaled=bool(args.abl_bystander_unscaled),
             coalition_norm=bool(args.abl_coalition_norm),
             gamma_max=args.abl_gamma_max,
             hop_norm=bool(args.abl_hop_norm),
@@ -299,6 +308,7 @@ def main():
             shared_w8_horizons=args.jlens_horizons,
             shared_w8_k_vocab=args.abl_shared_w8_kvocab,
             unigram_path=data_dir / "unigram_counts_50432.npy",
+            jac_samples=args.abl_jac_samples,
             detach_prev=bool(args.abl_detach_prev),
             ema=args.abl_ema,
             seed=args.seed,
@@ -318,6 +328,8 @@ def main():
             layers_desc = "random_gap4(2..6->6..10)"
         elif args.abl_layer_mode == "random_anc_7_10":
             layers_desc = "rand_anc(7..10)" if not args.abl_enable_early else f"{args.abl_early_layer}->rand(7..10)"
+        elif args.abl_layer_mode == "split_6_9":
+            layers_desc = "split_anc(6..9)"
         else:
             layers_desc = f"{args.abl_early_layer}->{args.abl_anchor_layer}" if args.abl_enable_early else f"anc{args.abl_anchor_layer}"
         abl_meta = {
@@ -330,10 +342,14 @@ def main():
             "abl_window": args.abl_window,
             "abl_select_mode": args.abl_select_mode,
             "abl_metric": args.abl_metric,
+            "abl_j_mode": args.abl_j_mode,
+            "abl_live_readout": args.abl_live_readout,
+            "abl_reuse_clean_nll": args.abl_reuse_clean_nll,
             "abl_loss_kind": args.abl_loss_kind,
             "abl_exp_beta": args.abl_exp_beta,
             "abl_bystander_tau": args.abl_bystander_tau,
             "abl_bystander_w": args.abl_bystander_w,
+            "abl_bystander_unscaled": args.abl_bystander_unscaled,
             "abl_gamma_max": args.abl_gamma_max,
             "abl_nll_cap": args.abl_nll_cap,
             "abl_live_target_head": args.abl_live_target_head,
@@ -497,7 +513,8 @@ def main():
                     extra_jlens_flops_tot += jlens_ctrl.estimate_call_flops(did_refresh=did_w8_ref)
                 elif active_jlens and args.jlens_mode == "ablation":
                     ce_loss, tok_nll, interm, x_raw = fwd_model(xb, yb, return_interm=True)
-                    if micro_i == 0 and (not jlens_ctrl._initialized or (step - last_jlens_upd_step) >= args.jlens_upd_every):
+                    did_abl_ref = (micro_i == 0) and (not jlens_ctrl._initialized or (step - last_jlens_upd_step) >= args.jlens_upd_every)
+                    if did_abl_ref:
                         jlens_ctrl.refresh_snapshot(raw_model, [t.detach() for t in interm], x_raw, yb=yb)
                         last_jlens_upd_step = step
                     j_loss, j_obs, abl_stats_last = jlens_ctrl.compute_loss(raw_model, interm, yb, tok_nll)
@@ -509,6 +526,7 @@ def main():
                         abl_stats_last["n_seqs"],
                         abl_stats_last["l_ear"],
                         abl_stats_last["l_anc"],
+                        did_refresh=did_abl_ref,
                     )
                 elif prewarm_snap and micro_i == 0:
                     ce_loss, _, interm, x_raw = fwd_model(xb, yb, return_interm=True)

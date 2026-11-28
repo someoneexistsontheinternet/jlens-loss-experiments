@@ -458,19 +458,29 @@ class FrozenSoftcapReadout(nn.Module):
 
 
 class WorkspaceJLens(nn.Module):
-    """Layer lens `J_l` (`h_final ~ pure_rms_norm_fp32(x) @ J.T`) + running covariance `Sigma_l` + shared frozen readout."""
+    """Layer lens `J_l` (`ols_norm`, `identity`, or exact `true_jacobian` `E[dx_L/dx_l]`) + shared detached readout."""
 
-    def __init__(self, d_model: int, readout: FrozenSoftcapReadout, device: torch.device, norm_input: bool = True):
+    def __init__(
+        self,
+        d_model: int,
+        readout: FrozenSoftcapReadout,
+        device: torch.device,
+        norm_input: bool = True,
+        is_identity: bool = False,
+    ):
         super().__init__()
-        self.d_model = d_model
-        self.readout = readout
-        self.norm_input = norm_input
+        self.d_model     = d_model
+        self.readout     = readout
+        self.norm_input  = bool(norm_input)
+        self.is_identity = bool(is_identity)
         self.register_buffer("J", torch.eye(d_model, dtype=torch.float32, device=device))
         self.register_buffer("Sigma", torch.eye(d_model, dtype=torch.float32, device=device))
 
     def project_hidden(self, x: Tensor) -> Tensor:
         with torch.amp.autocast(device_type=x.device.type, enabled=False):
             xf = pure_rms_norm_fp32(x) if self.norm_input else x.float()
+            if self.is_identity:
+                return xf
             return xf @ self.J.t()
 
     def log_probs(self, x: Tensor) -> Tensor:
@@ -568,7 +578,7 @@ def _cluster_select_indices(
             W_assign = torch.zeros_like(S).scatter_(2, r_star, 1.0)
             W = W_assign * sqrt_p.unsqueeze(-1) * sgn
         else:  # `emeans`
-            tau = S_abs.std(dim=(-2, -1), keepdim=True, unbiased=False).clamp_min(0.05)
+            tau = (0.15 * S_abs.std(dim=(-2, -1), keepdim=True, unbiased=False)).clamp(0.02, 0.08)
             gamma = F.softmax((S_abs / tau).masked_fill(~val_out.unsqueeze(1), -1e9), dim=-1)
             W = sqrt_p.unsqueeze(-1) * gamma * sgn
 
@@ -714,6 +724,8 @@ def suppress_oblique_single_and_joint(
     valid: Tensor,
     strength: float = 1.0,
     match_norm: bool = True,
+    include_clean: bool = True,
+    include_joint: bool = True,
 ) -> tuple[Tensor, Tensor, Tensor]:
     with torch.amp.autocast(device_type=x.device.type, enabled=False):
         B, k, D = w_read.shape
@@ -721,10 +733,12 @@ def suppress_oblique_single_and_joint(
         w_read = w_read.float()
         d_write = d_write.float()
         old_norm = xf.norm(dim=-1, keepdim=True)
+        n_extra  = (1 if include_clean else 0) + (1 if include_joint else 0)
 
         if strength <= 0.0:
-            clean_rep = x.unsqueeze(1).expand(B, k + 2, D).contiguous()
-            return clean_rep, valid.clone(), valid.any(dim=-1)
+            clean_rep = x.unsqueeze(1).expand(B, k + n_extra, D).contiguous()
+            usa_all0  = valid.any(dim=-1) if include_joint else torch.zeros((B,), dtype=torch.bool, device=x.device)
+            return clean_rep, valid.clone(), usa_all0
 
         wx    = torch.einsum("bkd,bd->bk", w_read, xf)
         wd    = (w_read * d_write).sum(dim=-1)
@@ -740,26 +754,33 @@ def suppress_oblique_single_and_joint(
             ed_k  = ed_k * (old_n / new_n.clamp_min(1e-8))
         ed_k = torch.where(usable_k.unsqueeze(-1), ed_k, xf.unsqueeze(1))
 
-        w_m = torch.where(usable_k.unsqueeze(-1), w_read, torch.zeros_like(w_read))
-        d_m = torch.where(usable_k.unsqueeze(-1), d_write, torch.zeros_like(d_write))
-        gram  = torch.matmul(w_m, d_m.transpose(-1, -2))
-        diag_scale = gram.diagonal(dim1=-2, dim2=-1).abs().amax(dim=-1, keepdim=True).clamp_min(1.0)
-        eye_k = torch.eye(k, dtype=torch.float32, device=x.device).unsqueeze(0)
-        gram_reg = gram + (1e-4 * diag_scale.unsqueeze(-1)) * eye_k
-        rhs   = torch.einsum("bkd,bd->bk", w_m, xf).unsqueeze(-1)
-        alpha = torch.linalg.solve(gram_reg, rhs).squeeze(-1)
-        alpha = torch.where(usable_k, alpha, torch.zeros_like(alpha))
-        ed_all = xf - strength * torch.einsum("bk,bkd->bd", alpha, d_m)
-        usable_all = usable_k.any(dim=-1) & torch.isfinite(ed_all).all(dim=-1)
+        parts = [xf.unsqueeze(1)] if include_clean else []
+        parts.append(ed_k)
 
-        if match_norm:
-            new_na = ed_all.norm(dim=-1, keepdim=True)
-            ok_na  = (old_norm[:, 0] > 1e-8) & (new_na[:, 0] > 1e-6 * old_norm[:, 0].clamp_min(1e-8))
-            usable_all = usable_all & ok_na
-            ed_all = ed_all * (old_norm / new_na.clamp_min(1e-8))
-        ed_all = torch.where(usable_all.unsqueeze(-1), ed_all, xf)
+        if include_joint:
+            w_m = torch.where(usable_k.unsqueeze(-1), w_read, torch.zeros_like(w_read))
+            d_m = torch.where(usable_k.unsqueeze(-1), d_write, torch.zeros_like(d_write))
+            gram  = torch.matmul(w_m, d_m.transpose(-1, -2))
+            diag_scale = gram.diagonal(dim1=-2, dim2=-1).abs().amax(dim=-1, keepdim=True).clamp_min(1.0)
+            eye_k = torch.eye(k, dtype=torch.float32, device=x.device).unsqueeze(0)
+            gram_reg = gram + (1e-4 * diag_scale.unsqueeze(-1)) * eye_k
+            rhs   = torch.einsum("bkd,bd->bk", w_m, xf).unsqueeze(-1)
+            alpha = torch.linalg.solve(gram_reg, rhs).squeeze(-1)
+            alpha = torch.where(usable_k, alpha, torch.zeros_like(alpha))
+            ed_all = xf - strength * torch.einsum("bk,bkd->bd", alpha, d_m)
+            usable_all = usable_k.any(dim=-1) & torch.isfinite(ed_all).all(dim=-1)
 
-        probes = torch.cat([xf.unsqueeze(1), ed_k, ed_all.unsqueeze(1)], dim=1).to(x.dtype)
+            if match_norm:
+                new_na = ed_all.norm(dim=-1, keepdim=True)
+                ok_na  = (old_norm[:, 0] > 1e-8) & (new_na[:, 0] > 1e-6 * old_norm[:, 0].clamp_min(1e-8))
+                usable_all = usable_all & ok_na
+                ed_all = ed_all * (old_norm / new_na.clamp_min(1e-8))
+            ed_all = torch.where(usable_all.unsqueeze(-1), ed_all, xf)
+            parts.append(ed_all.unsqueeze(1))
+        else:
+            usable_all = torch.zeros((B,), dtype=torch.bool, device=x.device)
+
+        probes = torch.cat(parts, dim=1).to(x.dtype)
         return probes, usable_k, usable_all
 
 _compiled_suppress_oblique = torch.compile(suppress_oblique_single_and_joint, dynamic=True)
@@ -791,6 +812,72 @@ def _sampled_softcap_nll_vec(
 _compiled_sampled_softcap_nll_vec = torch.compile(_sampled_softcap_nll_vec, dynamic=True)
 
 
+def compute_effective_feature_weights(
+    weights: Tensor,
+    valid: Tensor,
+    exp_beta: float = 0.0,
+    exp_norm: bool = True,
+    bystander_tau: float = 0.0,
+    bystander_w: float = 0.0,
+    bystander_unscaled: bool = False,
+) -> Tensor:
+    u_c   = torch.where(valid, weights.detach().float().clamp(-0.6, 0.6), torch.zeros_like(weights, dtype=torch.float32))
+    tau   = max(0.0, float(bystander_tau))
+    w_bys = max(0.0, float(bystander_w))
+
+    if tau > 0.0 or w_bys > 0.0:
+        u_abs  = u_c.abs()
+        phi    = (torch.expm1(exp_beta * u_abs) * (1.0 / exp_beta)) if exp_beta > 0.0 else u_abs
+        is_pos = valid & (u_c >= tau) & (u_c > 0.0)
+        is_neg = valid & (u_c <= -tau) & (u_c < 0.0)
+        is_bys = valid & (~is_pos) & (~is_neg)
+
+        if bystander_unscaled:
+            # Normalize ONLY active (`|u_c| >= tau`) exponential terms; keep `|u_c| < tau` bystanders at full unshrunk `-w_bys`!
+            if exp_norm and exp_beta > 0.0:
+                is_act  = is_pos | is_neg
+                n_act   = is_act.float().sum().clamp_min(1.0)
+                mean_au = (u_abs * is_act.float()).sum() / n_act
+                mean_ap = (phi * is_act.float()).sum() / n_act
+                phi_eff = torch.where(mean_ap > 1e-8, phi * (mean_au / mean_ap.clamp_min(1e-8)), phi)
+            else:
+                phi_eff = phi
+            return torch.where(
+                is_pos,
+                phi_eff,
+                torch.where(is_neg, -(phi_eff + w_bys), torch.where(is_bys, torch.full_like(u_c, -w_bys), torch.zeros_like(u_c))),
+            )
+
+        u_raw = torch.where(
+            is_pos,
+            phi,
+            torch.where(is_neg, -(phi + w_bys), torch.where(is_bys, torch.full_like(u_c, -w_bys), torch.zeros_like(u_c))),
+        )
+        if exp_norm:
+            nat_ref = torch.where(
+                is_pos,
+                u_abs,
+                torch.where(is_neg, u_abs + w_bys, torch.where(is_bys, torch.full_like(u_c, w_bys), torch.zeros_like(u_c))),
+            )
+            n_val  = valid.float().sum().clamp_min(1.0)
+            mean_t = nat_ref.sum() / n_val
+            mean_r = u_raw.abs().sum() / n_val
+            return torch.where(mean_r > 1e-8, u_raw * (mean_t / mean_r.clamp_min(1e-8)), u_raw)
+        return u_raw
+
+    if exp_beta > 0.0:
+        u_raw = torch.sign(u_c) * (torch.expm1(exp_beta * u_c.abs()) * (1.0 / exp_beta))
+        u_raw = torch.where(valid, u_raw, torch.zeros_like(u_raw))
+        if exp_norm:
+            n_val  = valid.float().sum().clamp_min(1.0)
+            mean_c = u_c.abs().sum() / n_val
+            mean_r = u_raw.abs().sum() / n_val
+            return u_raw * (mean_c / mean_r.clamp_min(1e-8))
+        return u_raw
+
+    return u_c
+
+
 def compute_feature_loss_pregathered(
     lq_sel: Tensor,
     weights: Tensor,
@@ -800,6 +887,7 @@ def compute_feature_loss_pregathered(
     exp_norm: bool = True,
     bystander_tau: float = 0.0,
     bystander_w: float = 0.0,
+    bystander_unscaled: bool = False,
 ) -> Tensor:
     with torch.amp.autocast(device_type=lq_sel.device.type, enabled=False):
         w = torch.where(valid, weights.detach().float(), torch.zeros_like(weights, dtype=torch.float32))
@@ -809,47 +897,10 @@ def compute_feature_loss_pregathered(
             return -(w * lq_f).sum(dim=-1)
 
         if loss_kind == "exp_signed_clamped":
-            u_c   = torch.where(valid, w.clamp(-0.6, 0.6), torch.zeros_like(w))
-            tau   = max(0.0, float(bystander_tau))
-            w_bys = max(0.0, float(bystander_w))
-
-            if tau > 0.0 or w_bys > 0.0:
-                u_abs  = u_c.abs()
-                phi    = (torch.expm1(exp_beta * u_abs) * (1.0 / exp_beta)) if exp_beta > 0.0 else u_abs
-                is_pos = valid & (u_c >= tau) & (u_c > 0.0)
-                is_neg = valid & (u_c <= -tau) & (u_c < 0.0)
-                is_bys = valid & (~is_pos) & (~is_neg)
-
-                u_raw = torch.where(
-                    is_pos,
-                    phi,
-                    torch.where(is_neg, -(phi + w_bys), torch.where(is_bys, torch.full_like(u_c, -w_bys), torch.zeros_like(u_c))),
-                )
-                if exp_norm:
-                    nat_ref = torch.where(
-                        is_pos,
-                        u_abs,
-                        torch.where(is_neg, u_abs + w_bys, torch.where(is_bys, torch.full_like(u_c, w_bys), torch.zeros_like(u_c))),
-                    )
-                    n_val   = valid.float().sum().clamp_min(1.0)
-                    mean_t  = nat_ref.sum() / n_val
-                    mean_r  = u_raw.abs().sum() / n_val
-                    u_tilde = torch.where(mean_r > 1e-8, u_raw * (mean_t / mean_r.clamp_min(1e-8)), u_raw)
-                else:
-                    u_tilde = u_raw
-            elif exp_beta > 0.0:
-                u_raw = torch.sign(u_c) * (torch.expm1(exp_beta * u_c.abs()) * (1.0 / exp_beta))
-                u_raw = torch.where(valid, u_raw, torch.zeros_like(u_raw))
-                if exp_norm:
-                    n_val = valid.float().sum().clamp_min(1.0)
-                    mean_c = u_c.abs().sum() / n_val
-                    mean_r = u_raw.abs().sum() / n_val
-                    u_tilde = u_raw * (mean_c / mean_r.clamp_min(1e-8))
-                else:
-                    u_tilde = u_raw
-            else:
-                u_tilde = u_c
-
+            u_tilde = compute_effective_feature_weights(
+                w, valid, exp_beta=exp_beta, exp_norm=exp_norm,
+                bystander_tau=bystander_tau, bystander_w=bystander_w, bystander_unscaled=bystander_unscaled,
+            )
             w_pos = F.relu(u_tilde)
             w_neg = F.relu(-u_tilde)
             q_sel = lq_f.exp().clamp(0.0, 1.0 - 1e-7)
@@ -891,11 +942,13 @@ def compute_feature_loss(
     exp_norm: bool = True,
     bystander_tau: float = 0.0,
     bystander_w: float = 0.0,
+    bystander_unscaled: bool = False,
 ) -> Tensor:
     lq_sel = logq.float().gather(-1, ids)
     return compute_feature_loss_pregathered(
         lq_sel, weights, valid, loss_kind=loss_kind, exp_beta=exp_beta,
         exp_norm=exp_norm, bystander_tau=bystander_tau, bystander_w=bystander_w,
+        bystander_unscaled=bystander_unscaled,
     )
 
 
@@ -1049,6 +1102,88 @@ def calibrate_usefulness(
     return u * gamma
 
 
+@torch._dynamo.disable
+def _compute_exact_prefix_jacobians(
+    raw_model: nn.Module,
+    interm_det: list[Tensor],
+    tracked_layers: list[int],
+    b_cal: Tensor,
+    pos_cal: Tensor,
+) -> list[Tensor]:
+    """
+    Exact expected causal Jacobians `J_l = E[d x_{L,p} / d x_{l,p}]` (`[D_out, D_in]`, matching Anthropic 2026 J-Lens
+    and `fit_toy_jacobian` in `jlens_aux_loss_demo.py`) across ALL `tracked_layers` in ONE single-position prefix-KV
+    forward + batched VJP pass (`dgrad`-only via detached FP32 weights, zero parameter `.grad` mutation!).
+    """
+    dev      = interm_det[0].device
+    T        = interm_det[0].shape[1]
+    D        = raw_model.cfg.d_model
+    H        = raw_model.cfg.n_heads
+    Dh       = raw_model.cfg.head_dim
+    n_layers = raw_model.cfg.n_layers
+    min_l    = min(tracked_layers)
+    B_cal    = b_cal.shape[0]
+    inv_sq   = 1.0 / math.sqrt(float(Dh))
+
+    with torch.no_grad(), torch.amp.autocast(device_type=dev.type, enabled=False):
+        uniq_b, inv_b = torch.unique(b_cal, sorted=True, return_inverse=True)
+        B_u = uniq_b.shape[0]
+        cos_t = raw_model.cos[:, :, :T, :].detach().float()
+        sin_t = raw_model.sin[:, :, :T, :].detach().float()
+        kv_clean = []
+        for m in range(min_l, n_layers):
+            blk = raw_model.blocks[m]
+            xb  = interm_det[m - 1][uniq_b].detach().float()
+            an  = pure_rms_norm_fp32(xb, blk.attn_norm.eps) * blk.attn_norm.weight.detach().float()
+            qkv = F.linear(an, blk.wqkv.weight.detach().float()).view(B_u, T, 3, H, Dh)
+            kn  = pure_rms_norm_fp32(qkv[:, :, 1], blk.k_norm.eps) * blk.k_norm.weight.detach().float()
+            kc  = apply_rope(kn.transpose(1, 2), cos_t, sin_t)[inv_b].contiguous()
+            vc  = qkv[:, :, 2].transpose(1, 2)[inv_b].contiguous()
+            kv_clean.append((kc, vc))
+
+        t_ar      = torch.arange(T, device=dev)[None, :]
+        pre_valid = (t_ar < pos_cal[:, None])[:, None, None, :]
+        cos_p     = raw_model.cos[0, 0][pos_cal][:, None, None, :].detach().float()
+        sin_p     = raw_model.sin[0, 0][pos_cal][:, None, None, :].detach().float()
+        eye_b     = torch.eye(D, dtype=torch.float32, device=dev).unsqueeze(1).expand(D, B_cal, D).contiguous()
+
+    tracked_set = set(tracked_layers)
+    tap_map: dict[int, Tensor] = {}
+    with torch.enable_grad(), torch.amp.autocast(device_type=dev.type, enabled=False):
+        x = interm_det[min_l - 1][b_cal, pos_cal].detach().float().requires_grad_(True)
+        for idx_m, m in enumerate(range(min_l, n_layers)):
+            if m in tracked_set:
+                tap_map[m] = x
+            blk = raw_model.blocks[m]
+            k_pre, v_pre = kv_clean[idx_m]
+
+            an  = pure_rms_norm_fp32(x, blk.attn_norm.eps) * blk.attn_norm.weight.detach().float()
+            qkv = F.linear(an, blk.wqkv.weight.detach().float()).view(B_cal, 3, H, Dh)
+            qw  = apply_rope(
+                (pure_rms_norm_fp32(qkv[:, 0], blk.q_norm.eps) * blk.q_norm.weight.detach().float()).unsqueeze(2),
+                cos_p, sin_p,
+            )
+            kw  = apply_rope(
+                (pure_rms_norm_fp32(qkv[:, 1], blk.k_norm.eps) * blk.k_norm.weight.detach().float()).unsqueeze(2),
+                cos_p, sin_p,
+            )
+            vw  = qkv[:, 2].unsqueeze(2)
+
+            sc_pre = (torch.matmul(qw, k_pre.transpose(-1, -2)) * inv_sq).masked_fill(~pre_valid, -float("inf"))
+            sc_loc = (qw * kw).sum(dim=-1, keepdim=True) * inv_sq
+            probs  = torch.softmax(torch.cat([sc_pre, sc_loc], dim=-1), dim=-1)
+            y_attn = (torch.matmul(probs[..., :T], v_pre) + probs[..., T:] * vw).reshape(B_cal, D)
+
+            x  = x + F.linear(y_attn, blk.wo.weight.detach().float())
+            mn = pure_rms_norm_fp32(x, blk.mlp_norm.eps) * blk.mlp_norm.weight.detach().float()
+            g, u = F.linear(mn, blk.wgu.weight.detach().float()).chunk(2, dim=-1)
+            x  = x + F.linear(F.silu(g) * u, blk.wdown.weight.detach().float())
+
+        tap_list = [tap_map[l] for l in tracked_layers]
+        grads = torch.autograd.grad(x, tap_list, grad_outputs=eye_b, is_grads_batched=True)
+    return [g.detach().mean(dim=1).contiguous() for g in grads]
+
+
 # ==============================================================================
 # 4. Main Causal-Ablation Workspace J-Lens Controller
 # ==============================================================================
@@ -1070,11 +1205,15 @@ class CausalAblationJLensController:
         strength: float = 1.0,
         match_norm: bool = True,
         metric: str = "cov",
+        j_mode: str = "ols_norm",
+        live_readout: bool = False,
+        reuse_clean_nll: bool = False,
         loss_kind: str = "superpos_unlikelihood",
         exp_beta: float = 0.0,
         exp_norm: bool = True,
         bystander_tau: float = 0.0,
         bystander_w: float = 0.0,
+        bystander_unscaled: bool = False,
         coalition_norm: bool = True,
         gamma_max: float = 4.0,
         hop_norm: bool = True,
@@ -1088,6 +1227,7 @@ class CausalAblationJLensController:
         shared_w8_horizons: int = 8,
         shared_w8_k_vocab: int = 1536,
         unigram_path: Path | str | None = None,
+        jac_samples: int = 16,
         detach_prev: bool = False,
         ridge: float = 0.10,
         ema: float = 0.50,
@@ -1095,52 +1235,59 @@ class CausalAblationJLensController:
         seed: int = 42,
     ):
         assert 1 <= early_layer < anchor_layer < raw_model.cfg.n_layers
-        assert layer_mode in ("fixed", "random_gap4", "random_anc_7_10")
+        assert layer_mode in ("fixed", "random_gap4", "random_anc_7_10", "split_6_9")
         assert select_mode in ("greedy_cos", "maxmin", "kmeans", "emeans")
-        self.cfg              = raw_model.cfg
-        self.device           = device
-        self.early_layer      = early_layer
-        self.anchor_layer     = anchor_layer
-        self.layer_mode       = layer_mode
-        self.active_frac      = float(active_frac)
-        self.probe_seqs       = probe_seqs
-        self.pool_size        = pool_size
-        self.k_dirs           = k_dirs
-        self.window           = window
-        self.max_cosine       = max_cosine
-        self.select_mode      = select_mode
-        self.strength         = strength
-        self.match_norm       = match_norm
-        self.metric           = metric
-        self.loss_kind        = loss_kind
-        self.exp_beta         = float(exp_beta)
-        self.exp_norm         = bool(exp_norm)
-        self.bystander_tau    = float(bystander_tau)
-        self.bystander_w      = float(bystander_w)
-        self.coalition_norm   = coalition_norm
-        self.gamma_max        = float(gamma_max)
-        self.hop_norm         = hop_norm
-        self.enable_early     = enable_early
-        self.pos_mode         = pos_mode
-        self.nll_cap          = float(nll_cap)
-        self.live_target_head = bool(live_target_head)
+        assert j_mode in ("ols_norm", "identity", "true_jacobian")
+        self.cfg                = raw_model.cfg
+        self.device             = device
+        self.early_layer        = early_layer
+        self.anchor_layer       = anchor_layer
+        self.layer_mode         = layer_mode
+        self.active_frac        = float(active_frac)
+        self.probe_seqs         = probe_seqs
+        self.pool_size          = pool_size
+        self.k_dirs             = k_dirs
+        self.window             = window
+        self.max_cosine         = max_cosine
+        self.select_mode        = select_mode
+        self.strength           = strength
+        self.match_norm         = match_norm
+        self.metric             = metric
+        self.j_mode             = j_mode
+        self.live_readout       = bool(live_readout)
+        self.reuse_clean_nll    = bool(reuse_clean_nll)
+        self.loss_kind          = loss_kind
+        self.exp_beta           = float(exp_beta)
+        self.exp_norm           = bool(exp_norm)
+        self.bystander_tau      = float(bystander_tau)
+        self.bystander_w        = float(bystander_w)
+        self.bystander_unscaled = bool(bystander_unscaled)
+        self.coalition_norm     = coalition_norm
+        self.gamma_max          = float(gamma_max)
+        self.hop_norm           = hop_norm
+        self.enable_early       = enable_early
+        self.pos_mode           = pos_mode
+        self.nll_cap            = float(nll_cap)
+        self.live_target_head   = bool(live_target_head) or bool(live_readout)
         self.gold_w             = float(gold_w)
         self.shared_w8_weight   = float(shared_w8_weight)
         self.shared_w8_horizons = int(shared_w8_horizons)
         v_lim = min(50257, self.cfg.vocab_pad)
         self.shared_w8_k_vocab  = min(int(shared_w8_k_vocab), v_lim)
-        self.detach_prev    = detach_prev
-        self.ridge          = ridge
-        self.ema            = ema
-        self.pos_chunk_sz   = pos_chunk_sz
-        self._initialized   = False
-        self.pair_rng       = torch.Generator(device="cpu")
+        self.jac_samples        = max(2, int(jac_samples))
+        self.detach_prev        = detach_prev
+        self.ridge              = ridge
+        self.ema                = ema
+        self.pos_chunk_sz       = pos_chunk_sz
+        self._initialized       = (j_mode == "identity" and self.shared_w8_weight <= 0.0)
+        self.pair_rng           = torch.Generator(device="cpu")
         self.pair_rng.manual_seed(int(seed) + 1009)
 
         self.readout = FrozenSoftcapReadout(
             raw_model.out_norm.weight, raw_model.tok_emb.weight, softcap=self.cfg.softcap
         ).to(device)
 
+        self.split_anc_layers: list[int] = []
         if layer_mode == "random_gap4":
             if self.cfg.n_layers >= 12:
                 self.valid_layer_pairs = [
@@ -1160,13 +1307,24 @@ class CausalAblationJLensController:
                 anc_list = list(range(max(2, early_layer + 1), self.cfg.n_layers))
             self.valid_layer_pairs = [(early_layer, la) for la in anc_list]
             tracked_layers = sorted(set(anc_list) | {early_layer, anchor_layer})
+        elif layer_mode == "split_6_9":
+            if self.cfg.n_layers >= 12:
+                self.split_anc_layers = [6, 7, 8, 9]
+            else:
+                self.split_anc_layers = list(range(max(1, self.cfg.n_layers // 2), self.cfg.n_layers))
+            self.valid_layer_pairs = [(early_layer, la) for la in self.split_anc_layers]
+            tracked_layers = sorted(set(self.split_anc_layers) | {early_layer, anchor_layer})
         else:
             self.valid_layer_pairs = [(early_layer, anchor_layer)]
             tracked_layers = sorted({early_layer, anchor_layer})
 
+        use_norm_in = (j_mode == "ols_norm")
+        is_id       = (j_mode == "identity")
         self.tracked_layers = tracked_layers
         self.lenses = nn.ModuleDict({
-            str(l): WorkspaceJLens(self.cfg.d_model, self.readout, device).to(device)
+            str(l): WorkspaceJLens(
+                self.cfg.d_model, self.readout, device, norm_input=use_norm_in, is_identity=is_id
+            ).to(device)
             for l in tracked_layers
         })
         self.lens_early  = self.lenses[str(early_layer)]
@@ -1193,6 +1351,12 @@ class CausalAblationJLensController:
             self.w8_h_weights = None
             self.w8_vocab_log_q = None
 
+    def _anchor_probe_dims(self) -> tuple[bool, bool, int]:
+        inc_clean = not (self.reuse_clean_nll and self.window == 1 and self.live_target_head)
+        inc_joint = bool(self.coalition_norm)
+        p_anc     = self.k_dirs + (1 if inc_clean else 0) + (1 if inc_joint else 0)
+        return inc_clean, inc_joint, p_anc
+
     def estimate_call_flops(
         self,
         micro_batch: int,
@@ -1200,13 +1364,15 @@ class CausalAblationJLensController:
         n_uniq_seqs: int | None = None,
         early_layer: int | None = None,
         anchor_layer: int | None = None,
+        did_refresh: bool = False,
     ) -> float:
-        """Exact FLOPs per `compute_loss` call accounting for shared per-sequence KV extraction + multi-position probes."""
+        """Exact FLOPs per `compute_loss` call accounting for `P_anc`, `split_6_9` shared KV, and `true_jacobian` VJP."""
         T   = self.cfg.seq_len
         D   = self.cfg.d_model
         F_d = self.cfg.d_ff
         V   = self.cfg.vocab_pad
-        P   = self.k_dirs + 2
+        _, inc_joint, P_anc = self._anchor_probe_dims()
+        P_ear = self.k_dirs + 1 + (1 if inc_joint else 0)
         W_a = self.window
 
         if n_act is None:
@@ -1221,37 +1387,55 @@ class CausalAblationJLensController:
 
         ear_l = self.early_layer if early_layer is None else early_layer
         anc_l = self.anchor_layer if anchor_layer is None else anchor_layer
-        n_anc_blk = self.cfg.n_layers - anc_l
-        n_ear_blk = (anc_l - ear_l) if self.enable_early else 0
+        if self.layer_mode == "split_6_9" and not self.enable_early and self.split_anc_layers:
+            n_kv_blk  = float(self.cfg.n_layers - min(self.split_anc_layers))
+            n_anc_blk = sum(float(self.cfg.n_layers - l) for l in self.split_anc_layers) / float(len(self.split_anc_layers))
+            n_ear_blk = 0.0
+        else:
+            n_anc_blk = float(self.cfg.n_layers - anc_l)
+            n_ear_blk = float(anc_l - ear_l) if self.enable_early else 0.0
+            n_kv_blk  = n_anc_blk + n_ear_blk
 
-        # 1) Shared clean KV extraction (computed ONCE per unique sequence via KV-only `wqkv.weight[D:]` slice!)
         kv_proj_cols = (2 * D) if self.cfg.linear_mode == "bf16" else (3 * D)
-        kv_flops = (n_anc_blk + n_ear_blk) * (2.0 * n_uniq_seqs * T * D * kv_proj_cols)
-        # 2) Probe block linear + Flash-Prefix causal attention (avg prefix length = 0.5 * T + W)
+        kv_flops = n_kv_blk * (2.0 * n_uniq_seqs * T * D * kv_proj_cols)
+
         blk_lin_2n = 2.0 * (D * 3 * D + D * D + D * 2 * F_d + F_d * D)
-        anc_tok = n_act * P * W_a
+        anc_tok = n_act * P_anc * W_a
         anc_flops = n_anc_blk * (anc_tok * blk_lin_2n + 4.0 * anc_tok * (0.5 * T + W_a) * D)
-        ear_tok = n_act * P * 1
+        ear_tok = n_act * P_ear * 1
         ear_flops = n_ear_blk * (ear_tok * blk_lin_2n + 4.0 * ear_tok * (0.5 * T + 1) * D)
-        # 3) Readout FLOPs (topk pool 2NV + selected fwd/bwd 4NV = 6NV per clean position + 2NV per probe token)
-        ro_anc = 2.0 * (anc_tok * D * V) + 6.0 * (n_act * (D * D + D * V))
-        ro_ear = (2.0 * (ear_tok * (D * D + D * V)) + 6.0 * (n_act * (D * D + D * V))) if self.enable_early else 0.0
-        # Note: `gold_w` adds 0 extra GEMMs (`0.000%` extra FLOPs); `shared_w8_weight` evaluates ONLY on `n_act` positions!
+
+        j_mat_cost = 0.0 if self.j_mode == "identity" else (D * D)
+        ro_anc = 2.0 * (anc_tok * D * V) + 6.0 * (n_act * (j_mat_cost + D * V))
+        ro_ear = (2.0 * (ear_tok * (j_mat_cost + D * V)) + 6.0 * (n_act * (j_mat_cost + D * V))) if self.enable_early else 0.0
         sh_w8 = (
             4.0 * float(n_act) * float(self.shared_w8_horizons) * D * (D + float(self.shared_w8_k_vocab) + 1.0)
             if self.shared_w8_weight > 0.0 else 0.0
         )
-        return kv_flops + anc_flops + ear_flops + ro_anc + ro_ear + sh_w8
+        jac_fl = 0.0
+        if did_refresh and self.j_mode == "true_jacobian":
+            n_j_blk = float(self.cfg.n_layers - min(self.tracked_layers))
+            b_c = float(self.jac_samples)
+            jac_fl = n_j_blk * ((b_c + D * b_c) * blk_lin_2n + 2.0 * b_c * T * D * (2.0 * D))
+        return kv_flops + anc_flops + ear_flops + ro_anc + ro_ear + sh_w8 + jac_fl
 
     @torch.no_grad()
     def refresh_snapshot(self, raw_model: nn.Module, interm_det: list[Tensor], x_raw_final: Tensor, yb: Tensor | None = None):
         with torch.amp.autocast(device_type=x_raw_final.device.type, enabled=False):
             alpha = self.ema if self._initialized else 0.0
-            self.readout.update_ema_(raw_model.out_norm.weight, raw_model.tok_emb.weight, ema=alpha)
+            if self.live_readout:
+                self.readout.copy_from_(raw_model.out_norm.weight, raw_model.tok_emb.weight)
+            else:
+                self.readout.update_ema_(raw_model.out_norm.weight, raw_model.tok_emb.weight, ema=alpha)
 
             B, T, D = x_raw_final.shape
             M_tot   = B * T
             use_sh_w8 = (self.shared_w8_weight > 0.0) and (T > self.shared_w8_horizons)
+
+            if self.j_mode == "identity" and not use_sh_w8 and self.metric != "cov":
+                self._initialized = True
+                return
+
             if use_sh_w8:
                 H_w  = self.shared_w8_horizons
                 T_v  = T - (H_w - 1)
@@ -1263,45 +1447,52 @@ class CausalAblationJLensController:
                 K_r  = min(4096, M_tot)
                 ridx = torch.randint(0, M_tot, (K_r,), device=x_raw_final.device)
 
-            # Fix #3: Match Wave8 (036) — apply `pure_rms_norm_fp32` so 10x-norm sink tokens cannot hijack X^T X by 100x!
-            y_fin   = pure_rms_norm_fp32(x_raw_final.reshape(M_tot, D)[ridx])
-            inv_k   = 1.0 / float(K_r)
-            eye     = torch.eye(D, dtype=torch.float32, device=x_raw_final.device).unsqueeze(0)
+            inv_k = 1.0 / float(K_r)
+            eye   = torch.eye(D, dtype=torch.float32, device=x_raw_final.device).unsqueeze(0)
 
-            # Batched Cholesky solve across all tracked layers (2 in `fixed`, 9 in `random_gap4`, <0.04ms/step amortized!)
-            x_stk = torch.stack(
-                [pure_rms_norm_fp32(interm_det[l_idx - 1].reshape(M_tot, D)[ridx]) for l_idx in self.tracked_layers],
-                dim=0,
-            )  # [L, K_r, D]
-            g_xx = torch.matmul(x_stk.transpose(-1, -2), x_stk) * inv_k
-            tr_g = g_xx.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).clamp_min(1e-6).unsqueeze(-1)
-            cxy  = torch.einsum("lkd,ke->lde", x_stk, y_fin) * inv_k
-            chol = torch.linalg.cholesky(g_xx + (self.ridge * tr_g) * eye)
-            j_all = torch.cholesky_solve(cxy, chol).transpose(-1, -2).contiguous()
+            if self.j_mode == "true_jacobian":
+                b_c = torch.randint(0, B, (self.jac_samples,), device=x_raw_final.device)
+                p_c = torch.randint(min(1, T - 1), T, (self.jac_samples,), device=x_raw_final.device)
+                j_list = _compute_exact_prefix_jacobians(raw_model, interm_det, self.tracked_layers, b_c, p_c)
+                for l_idx, j_mat in zip(self.tracked_layers, j_list):
+                    lens = self.lenses[str(l_idx)]
+                    lens.J.mul_(alpha).add_(j_mat, alpha=(1.0 - alpha))
 
-            if use_sh_w8:
-                # Reuse the EXACT SAME `[D, D]` Cholesky factor `chol[anc_pos]` to solve all 8 lookahead lenses `J_9^(0..7)`!
-                anc_pos  = self.tracked_layers.index(self.anchor_layer)
-                ridx_h   = ridx[:, None] + torch.arange(H_w, device=x_raw_final.device)[None, :]
-                if yb is not None:
-                    vw_win = torch.cumprod((yb.reshape(-1)[ridx_h] != EOT_TOKEN).float(), dim=-1)
-                else:
-                    vw_win = torch.ones((K_r, H_w), dtype=torch.float32, device=x_raw_final.device)
-                y_fh     = pure_rms_norm_fp32(x_raw_final.reshape(M_tot, D)[ridx_h]) * vw_win.unsqueeze(-1)
-                cnt_h    = vw_win.sum(dim=0).clamp_min(1.0).view(1, H_w, 1)
-                cxy_w8   = (torch.einsum("kd,khf->dhf", x_stk[anc_pos], y_fh) / cnt_h).reshape(D, H_w * D)
-                w_star   = torch.cholesky_solve(cxy_w8, chol[anc_pos]).view(D, H_w, D).permute(1, 0, 2).contiguous()
-                self.J_anc_w8.mul_(alpha).add_(w_star, alpha=(1.0 - alpha))
+            if self.j_mode == "ols_norm" or use_sh_w8 or self.metric == "cov":
+                y_fin = pure_rms_norm_fp32(x_raw_final.reshape(M_tot, D)[ridx])
+                x_stk = torch.stack(
+                    [pure_rms_norm_fp32(interm_det[l_idx - 1].reshape(M_tot, D)[ridx]) for l_idx in self.tracked_layers],
+                    dim=0,
+                )
+                if self.j_mode == "ols_norm" or use_sh_w8:
+                    g_xx = torch.matmul(x_stk.transpose(-1, -2), x_stk) * inv_k
+                    tr_g = g_xx.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).clamp_min(1e-6).unsqueeze(-1)
+                    chol = torch.linalg.cholesky(g_xx + (self.ridge * tr_g) * eye)
+                    if self.j_mode == "ols_norm":
+                        cxy   = torch.einsum("lkd,ke->lde", x_stk, y_fin) * inv_k
+                        j_all = torch.cholesky_solve(cxy, chol).transpose(-1, -2).contiguous()
+                        for idx_l, l_idx in enumerate(self.tracked_layers):
+                            self.lenses[str(l_idx)].J.mul_(alpha).add_(j_all[idx_l], alpha=(1.0 - alpha))
+                    if use_sh_w8:
+                        anc_pos = self.tracked_layers.index(self.anchor_layer)
+                        ridx_h  = ridx[:, None] + torch.arange(H_w, device=x_raw_final.device)[None, :]
+                        if yb is not None:
+                            vw_win = torch.cumprod((yb.reshape(-1)[ridx_h] != EOT_TOKEN).float(), dim=-1)
+                        else:
+                            vw_win = torch.ones((K_r, H_w), dtype=torch.float32, device=x_raw_final.device)
+                        y_fh   = pure_rms_norm_fp32(x_raw_final.reshape(M_tot, D)[ridx_h]) * vw_win.unsqueeze(-1)
+                        cnt_h  = vw_win.sum(dim=0).clamp_min(1.0).view(1, H_w, 1)
+                        cxy_w8 = (torch.einsum("kd,khf->dhf", x_stk[anc_pos], y_fh) / cnt_h).reshape(D, H_w * D)
+                        w_star = torch.cholesky_solve(cxy_w8, chol[anc_pos]).view(D, H_w, D).permute(1, 0, 2).contiguous()
+                        self.J_anc_w8.mul_(alpha).add_(w_star, alpha=(1.0 - alpha))
 
-            x_c = x_stk - x_stk.mean(dim=1, keepdim=True)
-            cov = torch.matmul(x_c.transpose(-1, -2), x_c) * inv_k
-            tr_c = cov.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).clamp_min(1e-6).unsqueeze(-1)
-            sig_all = cov / tr_c + 0.02 * eye
-
-            for idx_l, l_idx in enumerate(self.tracked_layers):
-                lens = self.lenses[str(l_idx)]
-                lens.J.mul_(alpha).add_(j_all[idx_l], alpha=(1.0 - alpha))
-                lens.Sigma.mul_(alpha).add_(sig_all[idx_l], alpha=(1.0 - alpha))
+                if self.metric == "cov":
+                    x_c = x_stk - x_stk.mean(dim=1, keepdim=True)
+                    cov = torch.matmul(x_c.transpose(-1, -2), x_c) * inv_k
+                    tr_c = cov.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).clamp_min(1e-6).unsqueeze(-1)
+                    sig_all = cov / tr_c + 0.02 * eye
+                    for idx_l, l_idx in enumerate(self.tracked_layers):
+                        self.lenses[str(l_idx)].Sigma.mul_(alpha).add_(sig_all[idx_l], alpha=(1.0 - alpha))
 
             self._initialized = True
 
@@ -1403,6 +1594,116 @@ class CausalAblationJLensController:
         uniq_b, kv_slot = torch.unique_consecutive(b_sel, return_inverse=True)
         return b_sel, pos, uniq_b, kv_slot
 
+    def _eval_anchor_group(
+        self,
+        raw_model: nn.Module,
+        interm: list[Tensor],
+        cur_anc: int,
+        kv_anc: list[tuple[Tensor, Tensor]],
+        b_each: Tensor,
+        pos_each: Tensor,
+        kv_slot: Tensor,
+        yb: Tensor,
+        tok_nll_2d: Tensor,
+        sup_fn,
+        adv_fn,
+        live_nw: Tensor | None,
+        live_u_bf: Tensor | None,
+        live_u_fp: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Evaluates 1 anchor layer `cur_anc` on sorted `(b_each, pos_each)` returning `(vec_anc, ids_a, u_anc, usable_a, val_a)`."""
+        W = self.window
+        k = self.k_dirs
+        inc_clean, inc_joint, P_anc = self._anchor_probe_dims()
+        N_g  = b_each.shape[0]
+        c_sz = self.pos_chunk_sz
+        lens_anc = self.lenses[str(cur_anc)]
+
+        h_anc_seq = interm[cur_anc - 1]
+        if self.detach_prev and cur_anc >= 2:
+            prev_a = interm[cur_anc - 2].detach()
+            h_anc_seq = prev_a + (h_anc_seq - prev_a)
+        x_anc_live = h_anc_seq[b_each, pos_each]
+
+        pool_a, probs_a = lens_anc.topk_pool_ids_and_probs(x_anc_live, pool_size=self.pool_size)
+        ids_a, w_a, d_a, val_a = select_diverse_from_pool(
+            pool_a, lens_anc, k=k, max_cosine=self.max_cosine, metric=self.metric,
+            select_mode=self.select_mode, pool_probs=probs_a,
+        )
+
+        with torch.no_grad():
+            anc_blocks = raw_model.blocks[cur_anc :]
+            w_offs = torch.arange(W, device=yb.device)
+            u_anc_parts = []
+            usable_a_parts = []
+            h_anc_det = interm[cur_anc - 1].detach()
+
+            for s in range(0, N_g, c_sz):
+                e = min(s + c_sz, N_g)
+                nc = e - s
+                probes_c, usa_c, usa_all_c = sup_fn(
+                    x_anc_live[s:e].detach(), w_a[s:e], d_a[s:e], val_a[s:e],
+                    strength=self.strength, match_norm=self.match_norm,
+                    include_clean=inc_clean, include_joint=inc_joint,
+                )
+                win_idx_c = pos_each[s:e, None] + w_offs[None, :]
+                h_clean_c = h_anc_det[b_each[s:e, None], win_idx_c]
+                h_win_c   = h_clean_c.unsqueeze(1).expand(nc, P_anc, W, self.cfg.d_model).clone()
+                h_win_c[:, :, 0, :] = probes_c
+
+                fin_c = adv_fn(
+                    anc_blocks, kv_anc, h_win_c, pos_each[s:e], raw_model.cos, raw_model.sin, kv_slot=kv_slot[s:e]
+                )
+                y_win_c  = yb[b_each[s:e, None], win_idx_c]
+                flat_fin = fin_c.reshape(-1, self.cfg.d_model)
+                flat_y   = y_win_c[:, None, :].expand(nc, P_anc, W).reshape(-1)
+                nll_pw   = self.readout.fast_nograd_target_nll(
+                    flat_fin, flat_y, norm_w_override=live_nw, U_bf16_override=live_u_bf, U_fp32_override=live_u_fp
+                ).view(nc, P_anc, W)
+
+                valid_y = (y_win_c != EOT_TOKEN).float()
+                wt_y = valid_y * self.win_weights.unsqueeze(0)
+                wt_y = wt_y / wt_y.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                scores_c = (nll_pw * wt_y.unsqueeze(1)).sum(dim=-1)
+
+                if inc_clean:
+                    clean_sc = scores_c[:, 0:1]
+                    k_off    = 1
+                else:
+                    clean_sc = (tok_nll_2d[b_each[s:e], pos_each[s:e]].float() * valid_y[:, 0]).unsqueeze(1)
+                    k_off    = 0
+
+                raw_u_c = scores_c[:, k_off : k_off + k] - clean_sc
+                if inc_joint:
+                    u_all_c = scores_c[:, k_off + k] - clean_sc.squeeze(1)
+                else:
+                    u_all_c = torch.zeros((nc,), dtype=torch.float32, device=yb.device)
+                u_anc_parts.append(calibrate_usefulness(raw_u_c, u_all_c, usa_c, usa_all_c, self.coalition_norm, self.gamma_max))
+                usable_a_parts.append(usa_c)
+
+            u_anc    = torch.cat(u_anc_parts, dim=0)
+            usable_a = torch.cat(usable_a_parts, dim=0)
+
+        y_gold = yb[b_each, pos_each]
+        if self.gold_w > 0.0:
+            ids_plus_gold = torch.cat([ids_a, y_gold.unsqueeze(1)], dim=1)
+            lq_all_anc    = lens_anc.selected_log_probs(x_anc_live, ids_plus_gold)
+            lq_sel_anc    = lq_all_anc[:, :k]
+            lq_gold_anc   = lq_all_anc[:, k]
+            gold_vec      = -float(self.gold_w) * lq_gold_anc.float() * (y_gold != EOT_TOKEN).float()
+        else:
+            lq_sel_anc    = lens_anc.selected_log_probs(x_anc_live, ids_a)
+            gold_vec      = None
+
+        vec_anc = compute_feature_loss_pregathered(
+            lq_sel_anc, u_anc, usable_a, loss_kind=self.loss_kind, exp_beta=self.exp_beta,
+            exp_norm=self.exp_norm, bystander_tau=self.bystander_tau, bystander_w=self.bystander_w,
+            bystander_unscaled=self.bystander_unscaled,
+        )
+        if gold_vec is not None:
+            vec_anc = vec_anc + gold_vec
+        return vec_anc, ids_a, u_anc, usable_a, val_a
+
     @torch._dynamo.disable
     def compute_loss(
         self,
@@ -1411,19 +1712,13 @@ class CausalAblationJLensController:
         yb: Tensor,
         tok_nll_det: Tensor,
     ) -> tuple[Tensor, Tensor, dict]:
-        W = self.window
         k = self.k_dirs
-        P = k + 2
         B_tot, T_tot = yb.shape
-        inv_m_tot = 1.0 / float(B_tot * T_tot)  # Fix #1: true per-token nat parity across all % active rungs!
+        inv_m_tot = 1.0 / float(B_tot * T_tot)
+        tok_nll_2d = tok_nll_det.view(B_tot, T_tot)
 
-        if self.layer_mode in ("random_gap4", "random_anc_7_10"):
-            p_idx = int(torch.randint(0, len(self.valid_layer_pairs), (1,), generator=self.pair_rng).item())
-            cur_ear, cur_anc = self.valid_layer_pairs[p_idx]
-        else:
-            cur_ear, cur_anc = self.early_layer, self.anchor_layer
-        lens_ear = self.lenses[str(cur_ear)]
-        lens_anc = self.lenses[str(cur_anc)]
+        if self.live_readout:
+            self.readout.copy_from_(raw_model.out_norm.weight, raw_model.tok_emb.weight)
 
         b_each, pos_each, uniq_b, kv_slot = self.select_probe_positions(yb, tok_nll_det)
         N_act = b_each.shape[0]
@@ -1442,125 +1737,112 @@ class CausalAblationJLensController:
         else:
             adv_fn = advance_local_window_kv
 
-        # --- 1. Anchor Layer (`cur_anc .. n_layers`, window `W`) ---
-        h_anc_seq = interm[cur_anc - 1]
-        if self.detach_prev and cur_anc >= 2:
-            prev_a = interm[cur_anc - 2].detach()
-            h_anc_seq = prev_a + (h_anc_seq - prev_a)
-        x_anc_live = h_anc_seq[b_each, pos_each]                # [N_act, D], grad-attached!
-
-        pool_a, probs_a = lens_anc.topk_pool_ids_and_probs(x_anc_live, pool_size=self.pool_size)
-        ids_a, w_a, d_a, val_a = select_diverse_from_pool(
-            pool_a, lens_anc, k=k, max_cosine=self.max_cosine, metric=self.metric,
-            select_mode=self.select_mode, pool_probs=probs_a,
-        )
-
-        with torch.no_grad():
-            anc_blocks = raw_model.blocks[cur_anc :]
-            anc_inputs = [interm[m - 1].detach() for m in range(cur_anc, self.cfg.n_layers)]
-            kv_anc = kv_fn(anc_blocks, anc_inputs, uniq_b, raw_model.cos, raw_model.sin)
-            if self.live_target_head:
-                live_nw   = raw_model.out_norm.weight.detach().float()
-                live_u_bf = raw_model.tok_emb.weight.detach().to(torch.bfloat16)
-                live_u_fp = None if use_fast_gpu else raw_model.tok_emb.weight.detach().float()
-            else:
-                live_nw = live_u_bf = live_u_fp = None
-
-            w_offs = torch.arange(W, device=yb.device)
-            u_anc_parts = []
-            usable_a_parts = []
-            h_anc_det = interm[cur_anc - 1].detach()
-
-            for s in range(0, N_act, c_sz):
-                e = min(s + c_sz, N_act)
-                nc = e - s
-                probes_c, usa_c, usa_all_c = sup_fn(
-                    x_anc_live[s:e].detach(), w_a[s:e], d_a[s:e], val_a[s:e],
-                    strength=self.strength, match_norm=self.match_norm,
-                )
-                win_idx_c = pos_each[s:e, None] + w_offs[None, :]
-                h_clean_c = h_anc_det[b_each[s:e, None], win_idx_c]
-                h_win_c   = h_clean_c.unsqueeze(1).expand(nc, P, W, self.cfg.d_model).clone()
-                h_win_c[:, :, 0, :] = probes_c
-
-                fin_c = adv_fn(
-                    anc_blocks, kv_anc, h_win_c, pos_each[s:e], raw_model.cos, raw_model.sin, kv_slot=kv_slot[s:e]
-                )
-                y_win_c = yb[b_each[s:e, None], win_idx_c]
-                flat_fin = fin_c.reshape(-1, self.cfg.d_model)
-                flat_y   = y_win_c[:, None, :].expand(nc, P, W).reshape(-1)
-                nll_pw   = self.readout.fast_nograd_target_nll(
-                    flat_fin, flat_y, norm_w_override=live_nw, U_bf16_override=live_u_bf, U_fp32_override=live_u_fp
-                ).view(nc, P, W)
-
-                valid_y = (y_win_c != EOT_TOKEN).float()
-                wt_y = valid_y * self.win_weights.unsqueeze(0)
-                wt_y = wt_y / wt_y.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-                scores_c = (nll_pw * wt_y.unsqueeze(1)).sum(dim=-1)
-
-                raw_u_c = scores_c[:, 1 : k + 1] - scores_c[:, 0:1]
-                u_all_c = scores_c[:, k + 1] - scores_c[:, 0]
-                u_anc_parts.append(calibrate_usefulness(raw_u_c, u_all_c, usa_c, usa_all_c, self.coalition_norm, self.gamma_max))
-                usable_a_parts.append(usa_c)
-
-            u_anc    = torch.cat(u_anc_parts, dim=0)
-            usable_a = torch.cat(usable_a_parts, dim=0)
-            del kv_anc
-
-        y_gold = yb[b_each, pos_each]
-        if self.gold_w > 0.0:
-            # Zero-extra-FLOP Gold SFT: append `y_gold` as 1 extra column inside the EXISTING `selected_log_probs` call!
-            ids_plus_gold = torch.cat([ids_a, y_gold.unsqueeze(1)], dim=1)
-            lq_all_anc    = lens_anc.selected_log_probs(x_anc_live, ids_plus_gold)
-            lq_sel_anc    = lq_all_anc[:, :k]
-            lq_gold_anc   = lq_all_anc[:, k]
-            gold_vec      = -float(self.gold_w) * lq_gold_anc.float() * (y_gold != EOT_TOKEN).float()
+        if self.live_readout:
+            live_nw = live_u_bf = live_u_fp = None
+        elif self.live_target_head:
+            live_nw   = raw_model.out_norm.weight.detach().float()
+            live_u_bf = raw_model.tok_emb.weight.detach().to(torch.bfloat16)
+            live_u_fp = None if use_fast_gpu else raw_model.tok_emb.weight.detach().float()
         else:
-            lq_sel_anc    = lens_anc.selected_log_probs(x_anc_live, ids_a)
-            gold_vec      = None
+            live_nw = live_u_bf = live_u_fp = None
 
-        vec_anc = compute_feature_loss_pregathered(
-            lq_sel_anc, u_anc, usable_a, loss_kind=self.loss_kind, exp_beta=self.exp_beta,
-            exp_norm=self.exp_norm, bystander_tau=self.bystander_tau, bystander_w=self.bystander_w,
-        )
-        if gold_vec is not None:
-            vec_anc = vec_anc + gold_vec
+        # --- Multi-Layer Shared-KV Split-Batch Mode (`split_6_9`, `enable_early == False`) ---
+        if self.layer_mode == "split_6_9" and not self.enable_early and self.split_anc_layers:
+            min_anc = min(self.split_anc_layers)
+            with torch.no_grad():
+                kv_base = kv_fn(
+                    raw_model.blocks[min_anc :],
+                    [interm[m - 1].detach() for m in range(min_anc, self.cfg.n_layers)],
+                    uniq_b, raw_model.cos, raw_model.sin,
+                )
+                perm = torch.randperm(N_act, device=yb.device)
+                chunks = torch.chunk(perm, len(self.split_anc_layers))
 
-        if self.shared_w8_weight > 0.0 and self.J_anc_w8 is not None:
-            # Shared-position 8-horizon lookahead `y_{t..t+7}` ONLY on the `N_act` (`1,311`) active `x_anc_live` tokens!
-            H_w    = self.shared_w8_horizons
-            h_offs = torch.arange(H_w, device=yb.device)[None, :]
-            t_kh   = (pos_each[:, None] + h_offs).clamp_max(T_tot - 1)
-            in_b   = (pos_each[:, None] + h_offs) < T_tot
-            y_kh   = yb[b_each[:, None], t_kh]
-            val_kh = torch.cumprod(((y_kh != EOT_TOKEN) & in_b).float(), dim=-1)
-            eff_wh = val_kh * self.w8_h_weights.unsqueeze(0)
-            eff_wh = eff_wh / eff_wh.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            vec_parts, u_parts, usa_parts, val_parts = [], [], [], []
+            for idx_c, l_anc in zip(chunks, self.split_anc_layers):
+                if idx_c.numel() == 0:
+                    continue
+                # Sorting `idx_c` preserves strict ascending `(b_each, pos_each)` and monotonic `kv_slot` for `build_seq_groups`!
+                sub = idx_c.sort()[0]
+                v_l, _, u_l, us_l, vl_l = self._eval_anchor_group(
+                    raw_model, interm, l_anc, kv_base[l_anc - min_anc :],
+                    b_each[sub], pos_each[sub], kv_slot[sub], yb, tok_nll_2d,
+                    sup_fn, adv_fn, live_nw, live_u_bf, live_u_fp,
+                )
+                vec_parts.append(v_l)
+                u_parts.append(u_l)
+                usa_parts.append(us_l)
+                val_parts.append(vl_l)
+            del kv_base
+
+            vec_anc        = torch.cat(vec_parts, dim=0)
+            u_anc          = torch.cat(u_parts, dim=0)
+            usable_a       = torch.cat(usa_parts, dim=0)
+            val_a          = torch.cat(val_parts, dim=0)
+            loss_anc_mean  = vec_anc.mean()
+            loss_anc_batch = vec_anc.sum() * inv_m_tot
+            cur_ear, cur_anc = self.early_layer, self.anchor_layer
+            ids_a = None
+        else:
+            if self.layer_mode in ("random_gap4", "random_anc_7_10"):
+                p_idx = int(torch.randint(0, len(self.valid_layer_pairs), (1,), generator=self.pair_rng).item())
+                cur_ear, cur_anc = self.valid_layer_pairs[p_idx]
+            else:
+                cur_ear, cur_anc = self.early_layer, self.anchor_layer
 
             with torch.no_grad():
-                u_g = torch.empty_like(self.w8_vocab_log_q).uniform_(1e-7, 1.0 - 1e-7)
-                _, c_ids = torch.topk(self.w8_vocab_log_q - torch.log(-torch.log(u_g)), self.shared_w8_k_vocab)
-                log_kc = math.log(float(self.shared_w8_k_vocab)) + self.w8_vocab_log_q[c_ids]
+                anc_blocks = raw_model.blocks[cur_anc :]
+                anc_inputs = [interm[m - 1].detach() for m in range(cur_anc, self.cfg.n_layers)]
+                kv_anc = kv_fn(anc_blocks, anc_inputs, uniq_b, raw_model.cos, raw_model.sin)
 
-            xn_w8 = pure_rms_norm_fp32(x_anc_live).to(torch.bfloat16)
-            j_w8  = self.J_anc_w8.detach().to(torch.bfloat16)
-            nw_bf = self.readout.norm_w.detach().to(torch.bfloat16)
-            h_nh  = (torch.einsum("nd,hdo->nho", xn_w8, j_w8) * nw_bf[None, None, :]).reshape(N_act * H_w, self.cfg.d_model)
-            u_bf  = self.readout.U_bf16.detach()
-            y_fl  = y_kh.reshape(N_act * H_w)
-            nll_fn = _compiled_sampled_softcap_nll_vec if use_fast_gpu else _sampled_softcap_nll_vec
-            nll_nh = nll_fn(h_nh, u_bf[y_fl], u_bf[c_ids], y_fl, c_ids, log_kc, float(self.cfg.softcap)).view(N_act, H_w)
-            w8_vec = (nll_nh * eff_wh).sum(dim=-1) * val_kh[:, 0]
-            vec_anc = vec_anc + float(self.shared_w8_weight) * w8_vec
+            vec_anc, ids_a, u_anc, usable_a, val_a = self._eval_anchor_group(
+                raw_model, interm, cur_anc, kv_anc,
+                b_each, pos_each, kv_slot, yb, tok_nll_2d,
+                sup_fn, adv_fn, live_nw, live_u_bf, live_u_fp,
+            )
+            del kv_anc
 
-        loss_anc_mean  = vec_anc.mean()
-        loss_anc_batch = vec_anc.sum() * inv_m_tot
+            if self.shared_w8_weight > 0.0 and self.J_anc_w8 is not None:
+                h_anc_seq  = interm[cur_anc - 1]
+                x_anc_live = h_anc_seq[b_each, pos_each]
+                H_w    = self.shared_w8_horizons
+                h_offs = torch.arange(H_w, device=yb.device)[None, :]
+                t_kh   = (pos_each[:, None] + h_offs).clamp_max(T_tot - 1)
+                in_b   = (pos_each[:, None] + h_offs) < T_tot
+                y_kh   = yb[b_each[:, None], t_kh]
+                val_kh = torch.cumprod(((y_kh != EOT_TOKEN) & in_b).float(), dim=-1)
+                eff_wh = val_kh * self.w8_h_weights.unsqueeze(0)
+                eff_wh = eff_wh / eff_wh.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+                with torch.no_grad():
+                    u_g = torch.empty_like(self.w8_vocab_log_q).uniform_(1e-7, 1.0 - 1e-7)
+                    _, c_ids = torch.topk(self.w8_vocab_log_q - torch.log(-torch.log(u_g)), self.shared_w8_k_vocab)
+                    log_kc = math.log(float(self.shared_w8_k_vocab)) + self.w8_vocab_log_q[c_ids]
+
+                xn_w8 = pure_rms_norm_fp32(x_anc_live).to(torch.bfloat16)
+                j_w8  = self.J_anc_w8.detach().to(torch.bfloat16)
+                nw_bf = self.readout.norm_w.detach().to(torch.bfloat16)
+                h_nh  = (torch.einsum("nd,hdo->nho", xn_w8, j_w8) * nw_bf[None, None, :]).reshape(N_act * H_w, self.cfg.d_model)
+                u_bf  = self.readout.U_bf16.detach()
+                y_fl  = y_kh.reshape(N_act * H_w)
+                nll_fn = _compiled_sampled_softcap_nll_vec if use_fast_gpu else _sampled_softcap_nll_vec
+                nll_nh = nll_fn(h_nh, u_bf[y_fl], u_bf[c_ids], y_fl, c_ids, log_kc, float(self.cfg.softcap)).view(N_act, H_w)
+                w8_vec = (nll_nh * eff_wh).sum(dim=-1) * val_kh[:, 0]
+                vec_anc = vec_anc + float(self.shared_w8_weight) * w8_vec
+
+            loss_anc_mean  = vec_anc.mean()
+            loss_anc_batch = vec_anc.sum() * inv_m_tot
 
         # --- 2. Early-Layer Telescoped Probes (`cur_ear .. cur_anc`, `W_early = 1` at `pos_each`!) ---
         loss_ear_mean  = torch.zeros((), dtype=torch.float32, device=yb.device)
         loss_ear_batch = torch.zeros((), dtype=torch.float32, device=yb.device)
         u_ear_abs = 0.0
-        if self.enable_early:
+        if self.enable_early and ids_a is not None:
+            lens_ear = self.lenses[str(cur_ear)]
+            lens_anc = self.lenses[str(cur_anc)]
+            inc_joint = bool(self.coalition_norm)
+            P_ear = k + 1 + (1 if inc_joint else 0)
+
             h_ear_seq = interm[cur_ear - 1]
             if self.detach_prev and cur_ear >= 2:
                 prev_e = interm[cur_ear - 2].detach()
@@ -1578,11 +1860,21 @@ class CausalAblationJLensController:
                 ear_inputs = [interm[m - 1].detach() for m in range(cur_ear, cur_anc)]
                 kv_ear = kv_fn(ear_blocks, ear_inputs, uniq_b, raw_model.cos, raw_model.sin)
 
-                if self.hop_norm:
-                    norm_a = u_anc.abs().sum(dim=-1, keepdim=True).clamp_min(0.05)
-                    u_anc_target = u_anc / norm_a
+                # Compute fixed anchor target weights BEFORE `hop_norm` so bystander `tau` is evaluated in true nat units
+                # and `sc_ec` never double-exponentiates `exp_beta`!
+                if self.loss_kind == "exp_signed_clamped":
+                    u_eff_anc = compute_effective_feature_weights(
+                        u_anc, usable_a, exp_beta=self.exp_beta, exp_norm=self.exp_norm,
+                        bystander_tau=self.bystander_tau, bystander_w=self.bystander_w,
+                        bystander_unscaled=self.bystander_unscaled,
+                    )
                 else:
-                    u_anc_target = u_anc
+                    u_eff_anc = u_anc
+                if self.hop_norm:
+                    norm_a = u_eff_anc.abs().sum(dim=-1, keepdim=True).clamp_min(0.05)
+                    u_anc_target = u_eff_anc / norm_a
+                else:
+                    u_anc_target = u_eff_anc
 
                 u_ear_parts = []
                 usable_e_parts = []
@@ -1592,6 +1884,7 @@ class CausalAblationJLensController:
                     probes_ec, usa_ec, usa_all_ec = sup_fn(
                         x_ear_live[s:e].detach(), w_e[s:e], d_e[s:e], val_e[s:e],
                         strength=self.strength, match_norm=self.match_norm,
+                        include_clean=True, include_joint=inc_joint,
                     )
                     at_anc_c = adv_fn(
                         ear_blocks, kv_ear, probes_ec.unsqueeze(2), pos_each[s:e],
@@ -1599,18 +1892,18 @@ class CausalAblationJLensController:
                     ).squeeze(2)
 
                     with torch.amp.autocast(device_type=yb.device.type, enabled=False):
-                        at_anc_h = lens_anc.project_hidden(at_anc_c.reshape(nc * P, self.cfg.d_model))
-                    ids_ac = ids_a[s:e].unsqueeze(1).expand(nc, P, k).reshape(nc * P, k)
-                    ut_c   = u_anc_target[s:e].unsqueeze(1).expand(nc, P, k).reshape(nc * P, k)
-                    usa_ac = usable_a[s:e].unsqueeze(1).expand(nc, P, k).reshape(nc * P, k)
+                        at_anc_h = lens_anc.project_hidden(at_anc_c.reshape(nc * P_ear, self.cfg.d_model))
+                    ids_ac = ids_a[s:e].unsqueeze(1).expand(nc, P_ear, k).reshape(nc * P_ear, k)
+                    ut_c   = u_anc_target[s:e].unsqueeze(1).expand(nc, P_ear, k).reshape(nc * P_ear, k)
+                    usa_ac = usable_a[s:e].unsqueeze(1).expand(nc, P_ear, k).reshape(nc * P_ear, k)
                     lq_ec  = self.readout.fast_nograd_selected_logprobs(at_anc_h, ids_ac)
                     sc_ec  = compute_feature_loss_pregathered(
-                        lq_ec, ut_c, usa_ac, loss_kind=self.loss_kind, exp_beta=self.exp_beta,
-                        exp_norm=self.exp_norm, bystander_tau=self.bystander_tau, bystander_w=self.bystander_w,
-                    ).view(nc, P)
+                        lq_ec, ut_c, usa_ac, loss_kind=self.loss_kind,
+                        exp_beta=0.0, exp_norm=False, bystander_tau=0.0, bystander_w=0.0,
+                    ).view(nc, P_ear)
 
                     raw_u_ec = sc_ec[:, 1 : k + 1] - sc_ec[:, 0:1]
-                    u_all_ec = sc_ec[:, k + 1] - sc_ec[:, 0]
+                    u_all_ec = (sc_ec[:, k + 1] - sc_ec[:, 0]) if inc_joint else torch.zeros((nc,), dtype=torch.float32, device=yb.device)
                     u_ear_parts.append(calibrate_usefulness(raw_u_ec, u_all_ec, usa_ec, usa_all_ec, self.coalition_norm, self.gamma_max))
                     usable_e_parts.append(usa_ec)
 
@@ -1623,6 +1916,7 @@ class CausalAblationJLensController:
             vec_ear        = compute_feature_loss_pregathered(
                 lq_sel_ear, u_ear, usable_e, loss_kind=self.loss_kind, exp_beta=self.exp_beta,
                 exp_norm=self.exp_norm, bystander_tau=self.bystander_tau, bystander_w=self.bystander_w,
+                bystander_unscaled=self.bystander_unscaled,
             )
             loss_ear_mean  = vec_ear.mean()
             loss_ear_batch = vec_ear.sum() * inv_m_tot
