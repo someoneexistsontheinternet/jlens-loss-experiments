@@ -15,6 +15,8 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from model_70m import NanoGPT70MConfig, NanoGPT70M
+from fast_kernels import extract_clean_kv_fast
+from ultra_probe_kernels import advance_local_window_kv_ultra
 from jlens_wave8 import Wave8SteinJLensController
 from jlens_ablation import (
     FrozenSoftcapReadout, WorkspaceJLens, select_diverse_fast, select_diverse_from_pool,
@@ -409,7 +411,7 @@ def main():
     g_dz = z_dz.grad[0, :5].tolist()
     assert g_dz[0] < -0.10 and abs(g_dz[1]) < 1e-5 and abs(g_dz[2]) < 1e-5 and 0.0 < g_dz[3] < g_dz[4], f"Deadzone grad mismatch: {g_dz}"
 
-    # Verify `pool_size=128` and `pool_size=256` across `greedy_cos`, `maxmin`, `kmeans`, `emeans` (surfacing rivals at ranks 65..255!):
+    # Verify `pool_size=128` and `pool_size=256` across `greedy_cos`, `maxmin`, `kmeans`, `emeans` + `k=12` (`P=14` non-pow2!) & `k=16`:
     ro_256 = FrozenSoftcapReadout(torch.ones(64, device=device), F.normalize(torch.randn((512, 64), device=device), dim=-1), softcap=30.0).to(device)
     lens_256 = WorkspaceJLens(64, ro_256, device).to(device)
     x_256 = torch.randn((16, 64), device=device)
@@ -417,12 +419,29 @@ def main():
         pl_p, pr_p = lens_256.topk_pool_ids_and_probs(x_256, pool_size=p_sz)
         assert pl_p.shape == (16, p_sz) and pr_p.shape == (16, p_sz)
         for smode in ("greedy_cos", "maxmin", "kmeans", "emeans"):
-            ids_p, _, _, val_p = select_diverse_from_pool(
-                pl_p, lens_256, k=8, max_cosine=0.85, metric="cov", select_mode=smode, pool_probs=pr_p
-            )
-            assert ids_p.shape == (16, 8) and bool(val_p.any().item())
-            if smode != "greedy_cos":
-                assert bool(val_p.all().item()), f"{smode} failed to fill k=8 at pool_size={p_sz}"
+            for k_test in (8, 12, 16):
+                ids_p, _, _, val_p = select_diverse_from_pool(
+                    pl_p, lens_256, k=k_test, max_cosine=0.85, metric="cov", select_mode=smode, pool_probs=pr_p
+                )
+                assert ids_p.shape == (16, k_test) and bool(val_p.any().item())
+                if smode != "greedy_cos":
+                    assert bool(val_p.all().item()), f"{smode} failed to fill k={k_test} at pool_size={p_sz}"
+
+    if device.type == "cuda":
+        # Explicit GPU `D=512, Dh=64` parity check for `k=12` (`P=14`, non-power-of-2 `PW=14`!) in `advance_local_window_kv_ultra`:
+        cfg_k12 = NanoGPT70MConfig(n_layers=2, d_model=512, n_heads=8, head_dim=64, d_ff=1792, vocab_pad=1024, seq_len=64, ce_backend="eager")
+        m_k12 = NanoGPT70M(cfg_k12).to(device).eval()
+        x_in12 = [torch.randn((3, 64, 512), device=device, dtype=torch.bfloat16) for _ in range(2)]
+        b_u12  = torch.tensor([0, 1, 2], device=device)
+        kv_12  = extract_clean_kv_fast(m_k12.blocks, x_in12, b_u12, m_k12.cos, m_k12.sin)
+        hw_12  = torch.randn((7, 14, 1, 512), device=device, dtype=torch.bfloat16)  # N_pos=7, P=14 (k=12!), W=1
+        pos_12 = torch.tensor([0, 5, 19, 31, 44, 50, 63], device=device)
+        slt_12 = torch.tensor([0, 0, 1, 1, 1, 2, 2], device=device, dtype=torch.int32)
+        out_u12 = advance_local_window_kv_ultra(m_k12.blocks, kv_12, hw_12.clone(), pos_12, m_k12.cos, m_k12.sin, slt_12, waves_per_eu=0)
+        out_r12 = advance_local_window_kv(m_k12.blocks, kv_12, hw_12.clone(), pos_12, m_k12.cos, m_k12.sin, slt_12)
+        assert torch.isfinite(out_u12).all()
+        cos_k12 = float(F.cosine_similarity(out_u12.float().reshape(-1), out_r12.float().reshape(-1), dim=0).item())
+        assert cos_k12 > 0.9999, f"k=12 (P=14) ultra kernel parity failed: cos={cos_k12}"
 
     # Verify `live_target_head=1` + `nll_cap=6.5` end-to-end inside CausalAblationJLensController:
     ctrl_bys = CausalAblationJLensController(
