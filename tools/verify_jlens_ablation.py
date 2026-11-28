@@ -198,6 +198,29 @@ def main():
     (ce64 + 0.05 * aux64).backward()
     assert st64["n_act"] == int(round(0.15 * 4 * 64)) and torch.isfinite(aux64)
     print(f"PASS 7: SelectedSoftcapLinearLogProbsFn grad_cos={g_cos:.6f} & multi-position active_frac=0.15 passed:", st64)
+
+    # 8. Verify all 3 Wave 4.1 fixes: (1) batch-wide 1/(B*T) normalization, (2) matched EMA on J & U, (3) pure_rms_norm_fp32 invariance!
+    exp_jbatch = 0.5 * (st64["loss_anc"] + st64["loss_ear"]) * (st64["n_act"] / float(4 * 64))
+    assert abs(float(aux64.item()) - exp_jbatch) < 1e-4, f"Expected batch-normalized j_loss={exp_jbatch}, got {aux64.item()}"
+
+    u_before = ctrl_mp.readout.U.clone()
+    with torch.no_grad():
+        m64.tok_emb.weight.add_(1.0)
+    ctrl_mp.refresh_snapshot(m64, [t.detach() for t in int64], xraw64)
+    # With ema=0.50 on an already-initialized controller, U must move halfway (+0.50), NOT snap 1.0!
+    u_delta = float((ctrl_mp.readout.U - u_before).mean().item())
+    assert abs(u_delta - 0.50) < 1e-4, f"Expected matched ema=0.50 update on readout.U (delta=0.50), got {u_delta}"
+
+    # Verify scale invariance & radial grad orthogonality (<grad, x> == 0) from `pure_rms_norm_fp32` in WorkspaceJLens:
+    x_s1 = torch.randn((8, 128), device=device, dtype=torch.float32, requires_grad=True)
+    x_s10 = (x_s1.detach() * 10.0).requires_grad_(True)
+    lp1  = ctrl_mp.lens_anchor.log_probs(x_s1)
+    lp10 = ctrl_mp.lens_anchor.log_probs(x_s10)
+    torch.testing.assert_close(lp1, lp10, atol=1e-4, rtol=1e-4)
+    lp1[:, :4].sum().backward()
+    rad_dot = float((x_s1.grad * x_s1.detach()).sum(dim=-1).abs().max().item())
+    assert rad_dot < 1e-4, f"Expected tangential grad (<grad, x> == 0), got {rad_dot}"
+    print(f"PASS 8: Verified 1/(B*T) nat normalization, matched J/U EMA={ctrl_mp.ema} (dU={u_delta:.4f}), and RMSNorm sink-invariance (rad_dot={rad_dot:.2e})")
     print("ALL VERIFICATION CHECKS PASSED.")
 
 

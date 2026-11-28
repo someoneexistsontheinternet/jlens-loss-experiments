@@ -33,7 +33,8 @@ class NanoGPT70MConfig:
     jlens_mode: str     = "none"   # "none" | "wave8" | "ablation"
     jlens_weight: float = 0.35
     ce_backend: str     = "triton" # "triton" (fused in-place row softcap CE) | "eager"
-    ce_chunk_sz: int    = 32768
+    ce_chunk_sz: int    = 4096     # Infinity-Cache resident (< 256 MB MI325X LLC!)
+    fused_block_ops: bool = True   # Fused Triton QKNorm+RoPE+BHTD & SwiGLU
 
 
 @triton.jit
@@ -208,7 +209,8 @@ def _dispatch_chunked_softcap_ce(
     softcap: float, backend: str, chunk_sz: int,
 ):
     if backend == "triton":
-        return FusedTritonChunkedSoftcapCEFn.apply(h_2d, w_vocab, targets_1d, softcap, chunk_sz)
+        from fast_kernels import FastChunkedSoftcapCEFn
+        return FastChunkedSoftcapCEFn.apply(h_2d, w_vocab, targets_1d, softcap, chunk_sz, True)
     return ChunkedSoftcapCEFn.apply(h_2d, w_vocab, targets_1d, softcap, chunk_sz)
 
 
@@ -235,9 +237,16 @@ class NanoGPTBlock(nn.Module):
         B, T, D = x.shape
         H, Dh   = self.cfg.n_heads, self.cfg.head_dim
         qkv = self.wqkv(self.attn_norm(x)).view(B, T, 3, H, Dh)
+        if self.cfg.fused_block_ops and x.is_cuda and Dh == 64:
+            from fast_kernels import FusedQKNormRoPEFn, FusedSwiGLUFn
+            q, k, v = FusedQKNormRoPEFn.apply(qkv, self.q_norm.weight, self.k_norm.weight, cos, sin, self.q_norm.eps)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(B, T, D)
+            x = x + self.wo(y)
+            x = x + self.wdown(FusedSwiGLUFn.apply(self.wgu(self.mlp_norm(x))))
+            return x
         q   = apply_rope(self.q_norm(qkv[:, :, 0]).transpose(1, 2), cos, sin)
         k   = apply_rope(self.k_norm(qkv[:, :, 1]).transpose(1, 2), cos, sin)
-        v   = qkv[:, :, 2].transpose(1, 2)
+        v   = qkv[:, :, 2].transpose(1, 2).contiguous()
         y   = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(B, T, D)
         x   = x + self.wo(y)
 

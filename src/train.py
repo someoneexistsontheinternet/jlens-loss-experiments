@@ -16,6 +16,7 @@ import torch.nn as nn
 from model_70m import NanoGPT70MConfig, NanoGPT70M
 from jlens_wave8 import Wave8SteinJLensController
 from jlens_ablation import CausalAblationJLensController
+from fast_kernels import compiled_newton_schulz_5, fast_clip_grad_norm_
 from fp8_kernels import TORCH_FP8_DTYPE, FP8_MAX, IS_GFX942
 from telemetry import CompressedJSONLLogger
 
@@ -85,12 +86,17 @@ class HybridMuonAdamW:
                 adam_1d.append(p)
 
         self.muon_bufs = [torch.zeros_like(p, dtype=torch.float32) for p in self.muon_params]
+        self.muon_by_shape = {}
+        for p, buf in zip(self.muon_params, self.muon_bufs):
+            ps, bufs = self.muon_by_shape.setdefault(p.shape, ([], []))
+            ps.append(p)
+            bufs.append(buf)
         groups = [
             {"params": adam_emb, "lr": adam_lr * 0.8, "base_lr": adam_lr * 0.8, "weight_decay": 0.01},
             {"params": adam_2d,  "lr": adam_lr,       "base_lr": adam_lr,       "weight_decay": wd},
             {"params": adam_1d,  "lr": adam_lr,       "base_lr": adam_lr,       "weight_decay": 0.0},
         ]
-        self.adam = torch.optim.AdamW([g for g in groups if g["params"]], betas=(0.9, 0.95))
+        self.adam = torch.optim.AdamW([g for g in groups if g["params"]], betas=(0.9, 0.95), fused=torch.cuda.is_available())
 
     def zero_grad(self):
         for p in self.muon_params:
@@ -105,18 +111,20 @@ class HybridMuonAdamW:
 
         if self.muon_params:
             lr_m = self.base_muon_lr * lr_mult
-            by_shape = {}
-            for p, buf in zip(self.muon_params, self.muon_bufs):
-                if p.grad is None:
+            ns_fn = compiled_newton_schulz_5 if self.muon_params[0].is_cuda else newton_schulz_5
+            for _, (ps, bufs) in self.muon_by_shape.items():
+                act = [(p, buf, p.grad.float()) for p, buf in zip(ps, bufs) if p.grad is not None]
+                if not act:
                     continue
-                g = p.grad.float()
-                buf.mul_(0.95).add_(g)
-                by_shape.setdefault(p.shape, []).append((p, g + 0.95 * buf))
-            for _, items in by_shape.items():
-                g_stk = torch.stack([it[1] for it in items], dim=0)
-                u_stk = newton_schulz_5(g_stk)
-                for idx_i, (p, _) in enumerate(items):
-                    p.mul_(1.0 - lr_m * self.wd).add_(u_stk[idx_i].to(p.dtype), alpha=-lr_m)
+                p_act = [t[0] for t in act]
+                b_act = [t[1] for t in act]
+                g_act = [t[2] for t in act]
+                torch._foreach_mul_(b_act, 0.95)
+                torch._foreach_add_(b_act, g_act)
+                nesterov = torch._foreach_add(g_act, b_act, alpha=0.95)
+                u_stk = ns_fn(torch.stack(nesterov, dim=0))
+                torch._foreach_mul_(p_act, 1.0 - lr_m * self.wd)
+                torch._foreach_add_(p_act, [u.to(p_act[0].dtype) for u in u_stk.unbind(0)], alpha=-lr_m)
 
 
 @torch.no_grad()
@@ -171,6 +179,7 @@ def main():
     ap.add_argument("--abl-enable-early", type=int, default=1)
     ap.add_argument("--abl-pos-mode", default="hard_easy", choices=["hard_easy", "uniform"])
     ap.add_argument("--abl-detach-prev", type=int, default=0)
+    ap.add_argument("--abl-ema", type=float, default=0.50)
     ap.add_argument("--opt", default="muon", choices=["muon", "adamw"])
     ap.add_argument("--muon-lr", type=float, default=0.02)
     ap.add_argument("--adam-lr", type=float, default=3e-3)
@@ -185,7 +194,8 @@ def main():
     ap.add_argument("--compile", type=int, default=1)
     ap.add_argument("--compile-mode", default="default")
     ap.add_argument("--ce-backend", default="triton", choices=["triton", "eager"])
-    ap.add_argument("--ce-chunk-sz", type=int, default=32768)
+    ap.add_argument("--ce-chunk-sz", type=int, default=4096)
+    ap.add_argument("--fused-block-ops", type=int, default=1)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -209,6 +219,7 @@ def main():
         jlens_weight=args.jlens_weight,
         ce_backend=args.ce_backend,
         ce_chunk_sz=args.ce_chunk_sz,
+        fused_block_ops=bool(args.fused_block_ops),
     )
     raw_model = NanoGPT70M(cfg).to(device)
     n_tot, n_trunk, flops_tok = raw_model.count_params_and_flops()
@@ -248,6 +259,7 @@ def main():
             enable_early=bool(args.abl_enable_early),
             pos_mode=args.abl_pos_mode,
             detach_prev=bool(args.abl_detach_prev),
+            ema=args.abl_ema,
         )
 
     grad_accum = max(1, args.batch_tokens // (args.micro_batch * args.seq_len))
@@ -303,6 +315,7 @@ def main():
     steady_ms = []
     extra_jlens_flops_tot = 0.0
     jlens_active_steps = 0
+    last_jlens_upd_step = -10**9
 
     for step in range(1, args.steps + 1):
         if step < args.warmup:
@@ -346,8 +359,9 @@ def main():
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 if active_jlens and args.jlens_mode == "wave8":
                     ce_loss, tok_nll, interm, x_raw = fwd_model(xb, yb, return_interm=True)
-                    if micro_i == 0 and (step == 1 or step % args.jlens_upd_every == 0):
+                    if micro_i == 0 and (step == 1 or (step - last_jlens_upd_step) >= args.jlens_upd_every):
                         jlens_ctrl.refresh_lenses([t.detach() for t in interm], x_raw, yb)
+                        last_jlens_upd_step = step
                     j_loss, j_obs = jlens_ctrl.compute_loss(
                         interm, raw_model.out_norm.weight, raw_model.tok_emb.weight, yb, tok_nll, cand_ids
                     )
@@ -356,8 +370,9 @@ def main():
                     jl_sum += float(j_obs.item()) / grad_accum
                 elif active_jlens and args.jlens_mode == "ablation":
                     ce_loss, tok_nll, interm, x_raw = fwd_model(xb, yb, return_interm=True)
-                    if micro_i == 0 and (not jlens_ctrl._initialized or step % args.jlens_upd_every == 0):
+                    if micro_i == 0 and (not jlens_ctrl._initialized or (step - last_jlens_upd_step) >= args.jlens_upd_every):
                         jlens_ctrl.refresh_snapshot(raw_model, [t.detach() for t in interm], x_raw)
+                        last_jlens_upd_step = step
                     j_loss, j_obs, abl_stats_last = jlens_ctrl.compute_loss(raw_model, interm, yb, tok_nll)
                     tot_loss = ce_loss + (args.jlens_weight * j_cos) * j_loss
                     jl_sum += float(j_obs.item()) / grad_accum
@@ -367,6 +382,7 @@ def main():
                 elif prewarm_snap and micro_i == 0:
                     ce_loss, _, interm, x_raw = fwd_model(xb, yb, return_interm=True)
                     jlens_ctrl.refresh_snapshot(raw_model, [t.detach() for t in interm], x_raw)
+                    last_jlens_upd_step = step
                     tot_loss = ce_loss
                 else:
                     ce_loss, _ = fwd_model(xb, yb, return_interm=False)
@@ -374,7 +390,7 @@ def main():
             (tot_loss / grad_accum).backward()
             ce_sum += float(ce_loss.detach().item()) / grad_accum
 
-        gnorm = float(torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0).item())
+        gnorm = fast_clip_grad_norm_(raw_model.parameters(), 1.0)
         opt.step(lr_m)
 
         do_eval = (step % args.eval_every == 0) or (step == args.steps)

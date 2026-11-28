@@ -527,10 +527,16 @@ def fast_clip_grad_norm_(parameters, max_norm: float = 1.0) -> float:
     grads = [p.grad for p in parameters if p.grad is not None]
     if not grads:
         return 0.0
-    norms = torch._foreach_norm(grads, 2.0)
-    tot_norm = torch.linalg.vector_norm(torch.stack([n.float() for n in norms]), 2.0)
+    by_dt: dict[torch.dtype, list[Tensor]] = {}
+    for g in grads:
+        by_dt.setdefault(g.dtype, []).append(g)
+    all_norms = []
+    for g_list in by_dt.values():
+        all_norms.extend(n.float() for n in torch._foreach_norm(g_list, 2.0))
+    tot_norm = torch.linalg.vector_norm(torch.stack(all_norms), 2.0)
     clip_coef = (max_norm / (tot_norm + 1e-6)).clamp_max(1.0)
-    torch._foreach_mul_(grads, clip_coef)
+    for dt, g_list in by_dt.items():
+        torch._foreach_mul_(g_list, clip_coef.to(dt))
     return float(tot_norm.item())
 
 
