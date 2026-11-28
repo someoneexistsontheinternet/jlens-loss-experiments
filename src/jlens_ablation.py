@@ -17,6 +17,8 @@ Causal-Ablation Workspace `J-Lens` (`jlens_mode = "ablation"`):
 from __future__ import annotations
 
 import math
+from pathlib import Path
+import numpy as np
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -763,6 +765,32 @@ def suppress_oblique_single_and_joint(
 _compiled_suppress_oblique = torch.compile(suppress_oblique_single_and_joint, dynamic=True)
 
 
+def _sampled_softcap_nll_vec(
+    h_2d: Tensor,
+    w_y: Tensor,
+    w_cand: Tensor,
+    y_1d: Tensor,
+    cand_ids: Tensor,
+    log_kc: Tensor,
+    softcap: float,
+) -> Tensor:
+    """Importance-sampled Softcap-CE returning per-row NLL `[M]` (`[N_act * H_w]`) for shared-position multi-horizon lookahead."""
+    raw_true = (h_2d.float() * w_y.float()).sum(dim=-1)
+    raw_cand = torch.matmul(h_2d, w_cand.t()).float()
+    if softcap > 0.0:
+        inv_sc  = 1.0 / softcap
+        lg_true = softcap * torch.tanh(raw_true * inv_sc)
+        lg_cand = softcap * torch.tanh(raw_cand * inv_sc)
+    else:
+        lg_true, lg_cand = raw_true, raw_cand
+    is_same  = (cand_ids.unsqueeze(0) == y_1d.unsqueeze(1))
+    adj_cand = torch.where(is_same, torch.full_like(lg_cand, -1e9), lg_cand - log_kc.unsqueeze(0))
+    return torch.logaddexp(lg_true, torch.logsumexp(adj_cand, dim=-1)) - lg_true
+
+
+_compiled_sampled_softcap_nll_vec = torch.compile(_sampled_softcap_nll_vec, dynamic=True)
+
+
 def compute_feature_loss_pregathered(
     lq_sel: Tensor,
     weights: Tensor,
@@ -1055,6 +1083,11 @@ class CausalAblationJLensController:
         pos_mode: str = "hard_easy",
         nll_cap: float = 0.0,
         live_target_head: bool = False,
+        gold_w: float = 0.0,
+        shared_w8_weight: float = 0.0,
+        shared_w8_horizons: int = 8,
+        shared_w8_k_vocab: int = 1536,
+        unigram_path: Path | str | None = None,
         detach_prev: bool = False,
         ridge: float = 0.10,
         ema: float = 0.50,
@@ -1091,6 +1124,11 @@ class CausalAblationJLensController:
         self.pos_mode         = pos_mode
         self.nll_cap          = float(nll_cap)
         self.live_target_head = bool(live_target_head)
+        self.gold_w             = float(gold_w)
+        self.shared_w8_weight   = float(shared_w8_weight)
+        self.shared_w8_horizons = int(shared_w8_horizons)
+        v_lim = min(50257, self.cfg.vocab_pad)
+        self.shared_w8_k_vocab  = min(int(shared_w8_k_vocab), v_lim)
         self.detach_prev    = detach_prev
         self.ridge          = ridge
         self.ema            = ema
@@ -1137,6 +1175,24 @@ class CausalAblationJLensController:
         w_vec = torch.tensor([RHO_HARMONIC ** m for m in range(window)], dtype=torch.float32, device=device)
         self.win_weights = w_vec / w_vec.sum()
 
+        if self.shared_w8_weight > 0.0:
+            H_w = self.shared_w8_horizons
+            eye_d = torch.eye(self.cfg.d_model, dtype=torch.float32, device=device)
+            self.J_anc_w8 = eye_d.unsqueeze(0).expand(H_w, self.cfg.d_model, self.cfg.d_model).clone()
+            hw = torch.tensor([RHO_HARMONIC ** h for h in range(H_w)], dtype=torch.float32, device=device)
+            self.w8_h_weights = hw / hw.sum()
+            if unigram_path is not None and Path(unigram_path).is_file():
+                cnts = np.load(unigram_path)[:v_lim].astype(np.float64)
+            else:
+                cnts = np.ones((v_lim,), dtype=np.float64)
+            p_v = np.maximum(cnts, 1.0) ** 0.75
+            p_v /= p_v.sum()
+            self.w8_vocab_log_q = torch.from_numpy(np.log(np.maximum(p_v, 1e-12)).astype(np.float32)).to(device)
+        else:
+            self.J_anc_w8 = None
+            self.w8_h_weights = None
+            self.w8_vocab_log_q = None
+
     def estimate_call_flops(
         self,
         micro_batch: int,
@@ -1180,18 +1236,33 @@ class CausalAblationJLensController:
         # 3) Readout FLOPs (topk pool 2NV + selected fwd/bwd 4NV = 6NV per clean position + 2NV per probe token)
         ro_anc = 2.0 * (anc_tok * D * V) + 6.0 * (n_act * (D * D + D * V))
         ro_ear = (2.0 * (ear_tok * (D * D + D * V)) + 6.0 * (n_act * (D * D + D * V))) if self.enable_early else 0.0
-        return kv_flops + anc_flops + ear_flops + ro_anc + ro_ear
+        # Note: `gold_w` adds 0 extra GEMMs (`0.000%` extra FLOPs); `shared_w8_weight` evaluates ONLY on `n_act` positions!
+        sh_w8 = (
+            4.0 * float(n_act) * float(self.shared_w8_horizons) * D * (D + float(self.shared_w8_k_vocab) + 1.0)
+            if self.shared_w8_weight > 0.0 else 0.0
+        )
+        return kv_flops + anc_flops + ear_flops + ro_anc + ro_ear + sh_w8
 
     @torch.no_grad()
-    def refresh_snapshot(self, raw_model: nn.Module, interm_det: list[Tensor], x_raw_final: Tensor):
+    def refresh_snapshot(self, raw_model: nn.Module, interm_det: list[Tensor], x_raw_final: Tensor, yb: Tensor | None = None):
         with torch.amp.autocast(device_type=x_raw_final.device.type, enabled=False):
             alpha = self.ema if self._initialized else 0.0
             self.readout.update_ema_(raw_model.out_norm.weight, raw_model.tok_emb.weight, ema=alpha)
 
             B, T, D = x_raw_final.shape
             M_tot   = B * T
-            K_r     = min(4096, M_tot)
-            ridx    = torch.randint(0, M_tot, (K_r,), device=x_raw_final.device)
+            use_sh_w8 = (self.shared_w8_weight > 0.0) and (T > self.shared_w8_horizons)
+            if use_sh_w8:
+                H_w  = self.shared_w8_horizons
+                T_v  = T - (H_w - 1)
+                K_r  = min(4096, B * T_v)
+                b_r  = torch.randint(0, B, (K_r,), device=x_raw_final.device)
+                t_r  = torch.randint(0, T_v, (K_r,), device=x_raw_final.device)
+                ridx = b_r * T + t_r
+            else:
+                K_r  = min(4096, M_tot)
+                ridx = torch.randint(0, M_tot, (K_r,), device=x_raw_final.device)
+
             # Fix #3: Match Wave8 (036) — apply `pure_rms_norm_fp32` so 10x-norm sink tokens cannot hijack X^T X by 100x!
             y_fin   = pure_rms_norm_fp32(x_raw_final.reshape(M_tot, D)[ridx])
             inv_k   = 1.0 / float(K_r)
@@ -1207,6 +1278,20 @@ class CausalAblationJLensController:
             cxy  = torch.einsum("lkd,ke->lde", x_stk, y_fin) * inv_k
             chol = torch.linalg.cholesky(g_xx + (self.ridge * tr_g) * eye)
             j_all = torch.cholesky_solve(cxy, chol).transpose(-1, -2).contiguous()
+
+            if use_sh_w8:
+                # Reuse the EXACT SAME `[D, D]` Cholesky factor `chol[anc_pos]` to solve all 8 lookahead lenses `J_9^(0..7)`!
+                anc_pos  = self.tracked_layers.index(self.anchor_layer)
+                ridx_h   = ridx[:, None] + torch.arange(H_w, device=x_raw_final.device)[None, :]
+                if yb is not None:
+                    vw_win = torch.cumprod((yb.reshape(-1)[ridx_h] != EOT_TOKEN).float(), dim=-1)
+                else:
+                    vw_win = torch.ones((K_r, H_w), dtype=torch.float32, device=x_raw_final.device)
+                y_fh     = pure_rms_norm_fp32(x_raw_final.reshape(M_tot, D)[ridx_h]) * vw_win.unsqueeze(-1)
+                cnt_h    = vw_win.sum(dim=0).clamp_min(1.0).view(1, H_w, 1)
+                cxy_w8   = (torch.einsum("kd,khf->dhf", x_stk[anc_pos], y_fh) / cnt_h).reshape(D, H_w * D)
+                w_star   = torch.cholesky_solve(cxy_w8, chol[anc_pos]).view(D, H_w, D).permute(1, 0, 2).contiguous()
+                self.J_anc_w8.mul_(alpha).add_(w_star, alpha=(1.0 - alpha))
 
             x_c = x_stk - x_stk.mean(dim=1, keepdim=True)
             cov = torch.matmul(x_c.transpose(-1, -2), x_c) * inv_k
@@ -1422,11 +1507,52 @@ class CausalAblationJLensController:
             usable_a = torch.cat(usable_a_parts, dim=0)
             del kv_anc
 
-        lq_sel_anc     = lens_anc.selected_log_probs(x_anc_live, ids_a)
-        vec_anc        = compute_feature_loss_pregathered(
+        y_gold = yb[b_each, pos_each]
+        if self.gold_w > 0.0:
+            # Zero-extra-FLOP Gold SFT: append `y_gold` as 1 extra column inside the EXISTING `selected_log_probs` call!
+            ids_plus_gold = torch.cat([ids_a, y_gold.unsqueeze(1)], dim=1)
+            lq_all_anc    = lens_anc.selected_log_probs(x_anc_live, ids_plus_gold)
+            lq_sel_anc    = lq_all_anc[:, :k]
+            lq_gold_anc   = lq_all_anc[:, k]
+            gold_vec      = -float(self.gold_w) * lq_gold_anc.float() * (y_gold != EOT_TOKEN).float()
+        else:
+            lq_sel_anc    = lens_anc.selected_log_probs(x_anc_live, ids_a)
+            gold_vec      = None
+
+        vec_anc = compute_feature_loss_pregathered(
             lq_sel_anc, u_anc, usable_a, loss_kind=self.loss_kind, exp_beta=self.exp_beta,
             exp_norm=self.exp_norm, bystander_tau=self.bystander_tau, bystander_w=self.bystander_w,
         )
+        if gold_vec is not None:
+            vec_anc = vec_anc + gold_vec
+
+        if self.shared_w8_weight > 0.0 and self.J_anc_w8 is not None:
+            # Shared-position 8-horizon lookahead `y_{t..t+7}` ONLY on the `N_act` (`1,311`) active `x_anc_live` tokens!
+            H_w    = self.shared_w8_horizons
+            h_offs = torch.arange(H_w, device=yb.device)[None, :]
+            t_kh   = (pos_each[:, None] + h_offs).clamp_max(T_tot - 1)
+            in_b   = (pos_each[:, None] + h_offs) < T_tot
+            y_kh   = yb[b_each[:, None], t_kh]
+            val_kh = torch.cumprod(((y_kh != EOT_TOKEN) & in_b).float(), dim=-1)
+            eff_wh = val_kh * self.w8_h_weights.unsqueeze(0)
+            eff_wh = eff_wh / eff_wh.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+            with torch.no_grad():
+                u_g = torch.empty_like(self.w8_vocab_log_q).uniform_(1e-7, 1.0 - 1e-7)
+                _, c_ids = torch.topk(self.w8_vocab_log_q - torch.log(-torch.log(u_g)), self.shared_w8_k_vocab)
+                log_kc = math.log(float(self.shared_w8_k_vocab)) + self.w8_vocab_log_q[c_ids]
+
+            xn_w8 = pure_rms_norm_fp32(x_anc_live).to(torch.bfloat16)
+            j_w8  = self.J_anc_w8.detach().to(torch.bfloat16)
+            nw_bf = self.readout.norm_w.detach().to(torch.bfloat16)
+            h_nh  = (torch.einsum("nd,hdo->nho", xn_w8, j_w8) * nw_bf[None, None, :]).reshape(N_act * H_w, self.cfg.d_model)
+            u_bf  = self.readout.U_bf16.detach()
+            y_fl  = y_kh.reshape(N_act * H_w)
+            nll_fn = _compiled_sampled_softcap_nll_vec if use_fast_gpu else _sampled_softcap_nll_vec
+            nll_nh = nll_fn(h_nh, u_bf[y_fl], u_bf[c_ids], y_fl, c_ids, log_kc, float(self.cfg.softcap)).view(N_act, H_w)
+            w8_vec = (nll_nh * eff_wh).sum(dim=-1) * val_kh[:, 0]
+            vec_anc = vec_anc + float(self.shared_w8_weight) * w8_vec
+
         loss_anc_mean  = vec_anc.mean()
         loss_anc_batch = vec_anc.sum() * inv_m_tot
 

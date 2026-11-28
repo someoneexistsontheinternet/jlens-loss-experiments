@@ -194,6 +194,9 @@ def main():
     ap.add_argument("--abl-pos-mode", default="hard_easy", choices=["hard_easy", "uniform"])
     ap.add_argument("--abl-nll-cap", type=float, default=0.0)
     ap.add_argument("--abl-live-target-head", type=int, default=0)
+    ap.add_argument("--abl-gold-w", type=float, default=0.0, help="Zero-extra-FLOP Gold SFT weight inside existing selected_log_probs")
+    ap.add_argument("--abl-shared-w8-weight", type=float, default=0.0, help="Shared-position 8-horizon lookahead weight on active L09 tokens")
+    ap.add_argument("--abl-shared-w8-kvocab", type=int, default=1536)
     ap.add_argument("--abl-detach-prev", type=int, default=0)
     ap.add_argument("--abl-ema", type=float, default=0.50)
     ap.add_argument("--opt", default="muon", choices=["muon", "adamw"])
@@ -291,6 +294,11 @@ def main():
             pos_mode=args.abl_pos_mode,
             nll_cap=args.abl_nll_cap,
             live_target_head=bool(args.abl_live_target_head),
+            gold_w=args.abl_gold_w,
+            shared_w8_weight=args.abl_shared_w8_weight,
+            shared_w8_horizons=args.jlens_horizons,
+            shared_w8_k_vocab=args.abl_shared_w8_kvocab,
+            unigram_path=data_dir / "unigram_counts_50432.npy",
             detach_prev=bool(args.abl_detach_prev),
             ema=args.abl_ema,
             seed=args.seed,
@@ -329,6 +337,8 @@ def main():
             "abl_gamma_max": args.abl_gamma_max,
             "abl_nll_cap": args.abl_nll_cap,
             "abl_live_target_head": args.abl_live_target_head,
+            "abl_gold_w": args.abl_gold_w,
+            "abl_shared_w8_weight": args.abl_shared_w8_weight,
             "abl_coalition_norm": args.abl_coalition_norm,
             "abl_hop_norm": args.abl_hop_norm,
             "jlens_every": args.jlens_every,
@@ -455,7 +465,7 @@ def main():
                         if did_abl_ref:
                             if interm_det is None:
                                 interm_det = [t.detach() for t in interm]
-                            jlens_ctrl.refresh_snapshot(raw_model, interm_det, x_raw)
+                            jlens_ctrl.refresh_snapshot(raw_model, interm_det, x_raw, yb=yb)
                             last_jlens_upd_step = step
                         j_loss, j_obs, abl_stats_last = jlens_ctrl.compute_loss(raw_model, interm, yb, tok_nll)
                         tot_loss = tot_loss + (args.jlens_weight * j_cos) * j_loss
@@ -470,7 +480,7 @@ def main():
                     elif prewarm_snap and micro_i == 0:
                         if interm_det is None:
                             interm_det = [t.detach() for t in interm]
-                        jlens_ctrl.refresh_snapshot(raw_model, interm_det, x_raw)
+                        jlens_ctrl.refresh_snapshot(raw_model, interm_det, x_raw, yb=yb)
                         last_jlens_upd_step = step
                 elif active_jlens and args.jlens_mode == "wave8":
                     ce_loss, tok_nll, interm, x_raw = fwd_model(xb, yb, return_interm=True)
@@ -488,7 +498,7 @@ def main():
                 elif active_jlens and args.jlens_mode == "ablation":
                     ce_loss, tok_nll, interm, x_raw = fwd_model(xb, yb, return_interm=True)
                     if micro_i == 0 and (not jlens_ctrl._initialized or (step - last_jlens_upd_step) >= args.jlens_upd_every):
-                        jlens_ctrl.refresh_snapshot(raw_model, [t.detach() for t in interm], x_raw)
+                        jlens_ctrl.refresh_snapshot(raw_model, [t.detach() for t in interm], x_raw, yb=yb)
                         last_jlens_upd_step = step
                     j_loss, j_obs, abl_stats_last = jlens_ctrl.compute_loss(raw_model, interm, yb, tok_nll)
                     tot_loss = ce_loss + (args.jlens_weight * j_cos) * j_loss
@@ -502,7 +512,7 @@ def main():
                     )
                 elif prewarm_snap and micro_i == 0:
                     ce_loss, _, interm, x_raw = fwd_model(xb, yb, return_interm=True)
-                    jlens_ctrl.refresh_snapshot(raw_model, [t.detach() for t in interm], x_raw)
+                    jlens_ctrl.refresh_snapshot(raw_model, [t.detach() for t in interm], x_raw, yb=yb)
                     last_jlens_upd_step = step
                     tot_loss = ce_loss
                 else:

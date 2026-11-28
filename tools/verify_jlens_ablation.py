@@ -460,6 +460,35 @@ def main():
     (ce_bs + 0.5 * aux_bs).backward()
     assert torch.isfinite(aux_bs) and 0.0 <= st_bs["bys_frac"] <= 1.0
     print(f"PASS 13: Verified Bystander Eviction + SNR Cleanups (grads={[round(x,3) for x in g_b]}, bys_frac={st_bs['bys_frac']:.2f})")
+
+    # 14. Verify Zero-FLOP Shared-Op Gold SFT (`gold_w`, including duplicate `y_gold in ids_a`!) & Shared-Position 8-Horizon Lookahead (`shared_w8_weight`):
+    ctrl_gsft = CausalAblationJLensController(
+        m_hyb, device=device, enable_early=False, anchor_layer=9,
+        active_frac=0.02, pool_size=256, k_dirs=8, window=1, select_mode="kmeans",
+        loss_kind="exp_signed_clamped", exp_beta=6.0, bystander_tau=0.05, bystander_w=0.25, gamma_max=1.0,
+        gold_w=0.15,
+    )
+    assert abs(ctrl_gsft.estimate_call_flops(8) - ctrl_bys.estimate_call_flops(8)) == 0.0, "Expected 0.000% extra FLOPs for gold_w!"
+    ctrl_gsft.refresh_snapshot(m_hyb, int_h_det, xraw_h, yb=yb_h)
+    m_hyb.zero_grad(set_to_none=True)
+    ce_g, nll_g, int_g, _ = m_hyb(xb_h, yb_h, return_interm=True)
+    aux_g, _, _ = ctrl_gsft.compute_loss(m_hyb, int_g, yb_h, nll_g)
+    (ce_g + 0.5 * aux_g).backward()
+    assert torch.isfinite(aux_g) and all(p.grad is not None and torch.isfinite(p.grad).all() for p in m_hyb.parameters())
+
+    ctrl_shw8 = CausalAblationJLensController(
+        m_hyb, device=device, enable_early=False, anchor_layer=9,
+        active_frac=0.02, pool_size=256, k_dirs=8, window=1, select_mode="kmeans",
+        loss_kind="exp_signed_clamped", exp_beta=6.0, bystander_tau=0.05, bystander_w=0.25, gamma_max=1.0,
+        shared_w8_weight=0.15, shared_w8_horizons=8, shared_w8_k_vocab=128,
+    )
+    ctrl_shw8.refresh_snapshot(m_hyb, int_h_det, xraw_h, yb=yb_h)
+    m_hyb.zero_grad(set_to_none=True)
+    ce_sw, nll_sw, int_sw, _ = m_hyb(xb_h, yb_h, return_interm=True)
+    aux_sw, _, _ = ctrl_shw8.compute_loss(m_hyb, int_sw, yb_h, nll_sw)
+    (ce_sw + 0.5 * aux_sw).backward()
+    assert torch.isfinite(aux_sw) and all(p.grad is not None and torch.isfinite(p.grad).all() for p in m_hyb.parameters())
+    print(f"PASS 14: Verified Zero-FLOP Gold SFT (aux={aux_g.item():.5f}) & Shared-Position 8-Horizon Lookahead (aux={aux_sw.item():.5f})")
     print("ALL VERIFICATION CHECKS PASSED.")
 
 

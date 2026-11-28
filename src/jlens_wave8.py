@@ -140,11 +140,13 @@ class Wave8SteinJLensController:
         eye = torch.eye(d_model, dtype=torch.float32, device=device)
         self.jlens_mat = eye.view(1, 1, d_model, d_model).expand(self.n_jlens, horizons, d_model, d_model).clone()
 
-        # 3. Unigram^0.75 proposal distribution for 4,096-way importance-sampled softmax
+        # 3. Unigram^0.75 proposal distribution for importance-sampled softmax
+        v_lim = min(50257, vocab_pad)
+        self.k_vocab = min(k_vocab, v_lim)
         if unigram_path is not None and Path(unigram_path).is_file():
-            cnts = np.load(unigram_path)[:50257].astype(np.float64)
+            cnts = np.load(unigram_path)[:v_lim].astype(np.float64)
         else:
-            cnts = np.ones((50257,), dtype=np.float64)
+            cnts = np.ones((v_lim,), dtype=np.float64)
         p_v = np.maximum(cnts, 1.0) ** 0.75
         p_v /= p_v.sum()
         self.vocab_log_q = torch.from_numpy(np.log(np.maximum(p_v, 1e-12)).astype(np.float32)).to(device)
