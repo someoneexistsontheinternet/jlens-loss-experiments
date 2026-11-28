@@ -447,38 +447,49 @@ def _softcap_ce_2half_reg_kernel(
     tl.store(row_ptr + offs0, g0.to(tl.bfloat16))
 
 
+@torch.no_grad()
+def fast_nograd_softcap_ce(h_2d: Tensor, w_vocab: Tensor, targets_1d: Tensor, softcap: float, chunk_sz: int = 16384):
+    M, _ = h_2d.shape
+    V = w_vocab.shape[0]
+    w_bf = w_vocab if w_vocab.dtype == torch.bfloat16 else w_vocab.to(torch.bfloat16)
+    h_bf = h_2d if h_2d.dtype == torch.bfloat16 else h_2d.to(torch.bfloat16)
+    inv_sc = (1.0 / softcap) if softcap > 0.0 else 0.0
+    nll_out = torch.empty((M,), dtype=torch.float32, device=h_2d.device)
+    max_rows = min(M, chunk_sz)
+    logits_buf = torch.empty((max_rows, V), dtype=torch.bfloat16, device=h_2d.device)
+    for s in range(0, M, chunk_sz):
+        e = min(s + chunk_sz, M)
+        n_r = e - s
+        buf = logits_buf[:n_r]
+        torch.matmul(h_bf[s:e], w_bf.t(), out=buf)
+        if 32768 < V <= 65536:
+            _softcap_target_nll_2half_reg_kernel[(n_r,)](
+                buf, buf.stride(0), targets_1d[s:e], nll_out[s:e],
+                V=V, SOFTCAP=float(softcap), INV_SOFTCAP=float(inv_sc), HALF_V=32768, num_warps=8,
+            )
+        else:
+            lg = (softcap * torch.tanh(buf.float() * inv_sc)) if softcap > 0.0 else buf.float()
+            nll_out[s:e] = torch.logsumexp(lg, dim=-1) - lg.gather(1, targets_1d[s:e].unsqueeze(1)).squeeze(1)
+    return nll_out.mean(), nll_out
+
+
 class FastChunkedSoftcapCEFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, h_2d: Tensor, w_vocab: Tensor, targets_1d: Tensor, softcap: float, chunk_sz: int = 4096, use_1pass_reg: bool = True):
         M, D = h_2d.shape
         V = w_vocab.shape[0]
-        w_bf = w_vocab if w_vocab.dtype == torch.bfloat16 else w_vocab.to(torch.bfloat16)
-        h_bf = h_2d if h_2d.dtype == torch.bfloat16 else h_2d.to(torch.bfloat16)
-        inv_sc = (1.0 / softcap) if softcap > 0.0 else 0.0
-        nll_out = torch.empty((M,), dtype=torch.float32, device=h_2d.device)
-        max_rows = min(M, chunk_sz)
-        logits_buf = torch.empty((max_rows, V), dtype=torch.bfloat16, device=h_2d.device)
-
-        if not torch.is_grad_enabled():
-            for s in range(0, M, chunk_sz):
-                e = min(s + chunk_sz, M)
-                n_r = e - s
-                buf = logits_buf[:n_r]
-                torch.matmul(h_bf[s:e], w_bf.t(), out=buf)
-                if 32768 < V <= 65536:
-                    _softcap_target_nll_2half_reg_kernel[(n_r,)](
-                        buf, buf.stride(0), targets_1d[s:e], nll_out[s:e],
-                        V=V, SOFTCAP=float(softcap), INV_SOFTCAP=float(inv_sc), HALF_V=32768, num_warps=8,
-                    )
-                else:
-                    lg = (softcap * torch.tanh(buf.float() * inv_sc)) if softcap > 0.0 else buf.float()
-                    nll_out[s:e] = torch.logsumexp(lg, dim=-1) - lg.gather(1, targets_1d[s:e].unsqueeze(1)).squeeze(1)
-            return nll_out.mean(), nll_out
-
         inv_m = 1.0 / float(M)
+
         dh = torch.empty((M, D), dtype=torch.bfloat16, device=h_2d.device)
         dw = torch.zeros((V, D), dtype=torch.float32, device=h_2d.device)
         dw_tmp = torch.empty((V, D), dtype=torch.bfloat16, device=h_2d.device)
+        nll_out = torch.empty((M,), dtype=torch.float32, device=h_2d.device)
+
+        w_bf = w_vocab if w_vocab.dtype == torch.bfloat16 else w_vocab.to(torch.bfloat16)
+        h_bf = h_2d if h_2d.dtype == torch.bfloat16 else h_2d.to(torch.bfloat16)
+        inv_sc = (1.0 / softcap) if softcap > 0.0 else 0.0
+        max_rows = min(M, chunk_sz)
+        logits_buf = torch.empty((max_rows, V), dtype=torch.bfloat16, device=h_2d.device)
 
         from model_70m import _softcap_ce_fwd_bwd_inplace_kernel
         for s in range(0, M, chunk_sz):

@@ -209,6 +209,9 @@ def _dispatch_chunked_softcap_ce(
     softcap: float, backend: str, chunk_sz: int,
 ):
     if backend == "triton":
+        if not torch.is_grad_enabled():
+            from fast_kernels import fast_nograd_softcap_ce
+            return fast_nograd_softcap_ce(h_2d, w_vocab, targets_1d, softcap, chunk_sz)
         from fast_kernels import FastChunkedSoftcapCEFn
         return FastChunkedSoftcapCEFn.apply(h_2d, w_vocab, targets_1d, softcap, chunk_sz, True)
     return ChunkedSoftcapCEFn.apply(h_2d, w_vocab, targets_1d, softcap, chunk_sz)
