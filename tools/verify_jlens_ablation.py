@@ -401,15 +401,15 @@ def main():
     assert g_b[1] > 0.10 and abs(g_b[1] - g_b[2]) < 1e-6, f"Expected identical unweighted bystander eviction on +/-0.02, got {g_b}"
     assert g_b[2] < g_b[3] < g_b[4], f"Expected strict monotonicity across -tau: {g_b}"
 
-    # Verify Pure Noise-Floor Deadzone (`bystander_tau=0.05, bystander_w=0.0` -> exact 0.0 grad on |u_c| < 0.05!)
-    z_dz = torch.tensor([[-4.6, -4.6, -4.6, -4.6, -4.6, 0.0]], device=device, requires_grad=True)
-    l_dz = compute_feature_loss(
-        z_dz.log_softmax(-1), ids_bys, w_bys_test, val_bys,
+    # Verify Pure Noise-Floor Deadzone (`bystander_tau=0.05, bystander_w=0.0` -> exact 0.0 direct grad on `lq_sel` for |u_c| < 0.05!)
+    lq_dz = z_bys.detach().log_softmax(-1)[:, :5].clone().requires_grad_(True)
+    l_dz = compute_feature_loss_pregathered(
+        lq_dz, w_bys_test, val_bys,
         loss_kind="exp_signed_clamped", exp_beta=6.0, exp_norm=True, bystander_tau=0.05, bystander_w=0.0,
     ).sum()
     l_dz.backward()
-    g_dz = z_dz.grad[0, :5].tolist()
-    assert g_dz[0] < -0.10 and abs(g_dz[1]) < 1e-5 and abs(g_dz[2]) < 1e-5 and 0.0 < g_dz[3] < g_dz[4], f"Deadzone grad mismatch: {g_dz}"
+    g_dz = lq_dz.grad[0].tolist()
+    assert g_dz[0] < -0.10 and abs(g_dz[1]) < 1e-7 and abs(g_dz[2]) < 1e-7 and 0.0 < g_dz[3] < g_dz[4], f"Deadzone grad mismatch: {g_dz}"
 
     # Verify `pool_size=128` and `pool_size=256` across `greedy_cos`, `maxmin`, `kmeans`, `emeans` + `k=12` (`P=14` non-pow2!) & `k=16`:
     ro_256 = FrozenSoftcapReadout(torch.ones(64, device=device), F.normalize(torch.randn((512, 64), device=device), dim=-1), softcap=30.0).to(device)
@@ -540,22 +540,23 @@ def main():
         assert rel_err < 1e-5, f"True Jacobian mismatch at L{t_layer}: rel_err={rel_err}"
     print(f"PASS 15: Verified `_compute_exact_prefix_jacobians` exact equality to full-seq Jacobian across L1 & L3 (rel_err={rel_err:.2e})")
 
-    # 16. Verify `live_readout=True` (zero lag + zero tok_emb grad!), `reuse_clean_nll=True` (`P=9`/`P=8` parity!), & `bystander_unscaled=True`:
-    z_unsc = torch.tensor([[-4.6, -4.6, -4.6, 0.0]], device=device, requires_grad=True)
-    z_unsc2 = torch.tensor([[-4.6, -4.6, -4.6, 0.0]], device=device, requires_grad=True)
+    # 16. Verify `live_readout=True` (zero lag + zero out_norm grad!), `reuse_clean_nll=True` (`P=9`/`P=8` parity!), & `bystander_unscaled=True`:
+    base_lq = torch.tensor([[-4.6, -4.6, -4.6, 0.0]], device=device).log_softmax(-1)[:, :3].detach()
+    lq_u1 = base_lq.clone().requires_grad_(True)
+    lq_u2 = base_lq.clone().requires_grad_(True)
     w_un = torch.tensor([[0.40, 0.01, -0.35]], device=device)
-    ids_un = torch.tensor([[0, 1, 2]], device=device)
     val_un = torch.ones((1, 3), dtype=torch.bool, device=device)
-    compute_feature_loss(
-        z_unsc.log_softmax(-1), ids_un, w_un, val_un,
+    compute_feature_loss_pregathered(
+        lq_u1, w_un, val_un,
         loss_kind="exp_signed_clamped", exp_beta=2.0, exp_norm=True, bystander_tau=0.05, bystander_w=0.25, bystander_unscaled=True,
     ).sum().backward()
-    compute_feature_loss(
-        z_unsc2.log_softmax(-1), ids_un, w_un, val_un,
+    compute_feature_loss_pregathered(
+        lq_u2, w_un, val_un,
         loss_kind="exp_signed_clamped", exp_beta=12.0, exp_norm=True, bystander_tau=0.05, bystander_w=0.25, bystander_unscaled=True,
     ).sum().backward()
-    # Bystander slot 1 (`u=0.01 < 0.05`) must have IDENTICAL unshrunk eviction gradient under beta=2 and beta=12!
-    assert abs(float(z_unsc.grad[0, 1].item() - z_unsc2.grad[0, 1].item())) < 1e-6, "bystander_unscaled was altered by exp_beta!"
+    assert abs(float(lq_u1.grad[0, 1].item() - 0.25)) < 1e-6 and abs(float(lq_u2.grad[0, 1].item() - 0.25)) < 1e-6, (
+        f"bystander_unscaled altered bystander grad: {lq_u1.grad} vs {lq_u2.grad}"
+    )
 
     # Verify `reuse_clean_nll=True` matches `reuse_clean_nll=False` and reduces FLOPs, plus `j_mode in ("identity", "true_jacobian")`, `split_6_9`, & fixed `random_gap4`:
     for j_md in ("identity", "true_jacobian"):
