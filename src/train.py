@@ -189,13 +189,14 @@ def main():
     ap.add_argument("--abl-exp-beta", type=float, default=0.0)
     ap.add_argument("--abl-exp-norm", type=int, default=1)
     ap.add_argument("--abl-bystander-tau", type=float, default=0.0)
+    ap.add_argument("--abl-bystander-rel-tau", type=float, default=0.0)
     ap.add_argument("--abl-bystander-w", type=float, default=0.0)
     ap.add_argument("--abl-bystander-unscaled", type=int, default=0)
     ap.add_argument("--abl-coalition-norm", type=int, default=1)
     ap.add_argument("--abl-gamma-max", type=float, default=4.0)
     ap.add_argument("--abl-hop-norm", type=int, default=1)
     ap.add_argument("--abl-enable-early", type=int, default=1)
-    ap.add_argument("--abl-layer-mode", default="fixed", choices=["fixed", "random_gap4", "random_anc_7_10", "split_6_9"])
+    ap.add_argument("--abl-layer-mode", default="fixed", choices=["fixed", "random_gap4", "random_anc_7_10", "random_3_11", "split_6_9", "split_3_11"])
     ap.add_argument("--abl-pos-mode", default="hard_easy", choices=["hard_easy", "uniform"])
     ap.add_argument("--abl-nll-cap", type=float, default=0.0)
     ap.add_argument("--abl-live-target-head", type=int, default=0)
@@ -293,6 +294,7 @@ def main():
             exp_beta=args.abl_exp_beta,
             exp_norm=bool(args.abl_exp_norm),
             bystander_tau=args.abl_bystander_tau,
+            bystander_rel_tau=args.abl_bystander_rel_tau,
             bystander_w=args.abl_bystander_w,
             bystander_unscaled=bool(args.abl_bystander_unscaled),
             coalition_norm=bool(args.abl_coalition_norm),
@@ -328,8 +330,12 @@ def main():
             layers_desc = "random_gap4(2..6->6..10)"
         elif args.abl_layer_mode == "random_anc_7_10":
             layers_desc = "rand_anc(7..10)" if not args.abl_enable_early else f"{args.abl_early_layer}->rand(7..10)"
+        elif args.abl_layer_mode == "random_3_11":
+            layers_desc = "rand_anc(3..11)"
         elif args.abl_layer_mode == "split_6_9":
             layers_desc = "split_anc(6..9)"
+        elif args.abl_layer_mode == "split_3_11":
+            layers_desc = "split_anc(3..11)"
         else:
             layers_desc = f"{args.abl_early_layer}->{args.abl_anchor_layer}" if args.abl_enable_early else f"anc{args.abl_anchor_layer}"
         abl_meta = {
@@ -348,6 +354,7 @@ def main():
             "abl_loss_kind": args.abl_loss_kind,
             "abl_exp_beta": args.abl_exp_beta,
             "abl_bystander_tau": args.abl_bystander_tau,
+            "abl_bystander_rel_tau": args.abl_bystander_rel_tau,
             "abl_bystander_w": args.abl_bystander_w,
             "abl_bystander_unscaled": args.abl_bystander_unscaled,
             "abl_gamma_max": args.abl_gamma_max,

@@ -1212,6 +1212,7 @@ class CausalAblationJLensController:
         exp_beta: float = 0.0,
         exp_norm: bool = True,
         bystander_tau: float = 0.0,
+        bystander_rel_tau: float = 0.0,
         bystander_w: float = 0.0,
         bystander_unscaled: bool = False,
         coalition_norm: bool = True,
@@ -1235,7 +1236,7 @@ class CausalAblationJLensController:
         seed: int = 42,
     ):
         assert 1 <= early_layer < anchor_layer < raw_model.cfg.n_layers
-        assert layer_mode in ("fixed", "random_gap4", "random_anc_7_10", "split_6_9")
+        assert layer_mode in ("fixed", "random_gap4", "random_anc_7_10", "random_3_11", "split_6_9", "split_3_11")
         assert select_mode in ("greedy_cos", "maxmin", "kmeans", "emeans")
         assert j_mode in ("ols_norm", "identity", "true_jacobian")
         self.cfg                = raw_model.cfg
@@ -1260,6 +1261,7 @@ class CausalAblationJLensController:
         self.exp_beta           = float(exp_beta)
         self.exp_norm           = bool(exp_norm)
         self.bystander_tau      = float(bystander_tau)
+        self.bystander_rel_tau  = float(bystander_rel_tau)
         self.bystander_w        = float(bystander_w)
         self.bystander_unscaled = bool(bystander_unscaled)
         self.coalition_norm     = coalition_norm
@@ -1307,12 +1309,22 @@ class CausalAblationJLensController:
                 anc_list = list(range(max(2, early_layer + 1), self.cfg.n_layers))
             self.valid_layer_pairs = [(early_layer, la) for la in anc_list]
             tracked_layers = sorted(set(anc_list) | {early_layer, anchor_layer})
+        elif layer_mode == "random_3_11":
+            min_past_2 = min(3, max(1, self.cfg.n_layers - 1))
+            anc_list = list(range(min_past_2, self.cfg.n_layers))
+            self.valid_layer_pairs = [(min(early_layer, max(1, la - 1)), la) for la in anc_list]
+            tracked_layers = sorted(set(anc_list) | {early_layer, anchor_layer})
         elif layer_mode == "split_6_9":
             if self.cfg.n_layers >= 12:
                 self.split_anc_layers = [6, 7, 8, 9]
             else:
                 self.split_anc_layers = list(range(max(1, self.cfg.n_layers // 2), self.cfg.n_layers))
             self.valid_layer_pairs = [(early_layer, la) for la in self.split_anc_layers]
+            tracked_layers = sorted(set(self.split_anc_layers) | {early_layer, anchor_layer})
+        elif layer_mode == "split_3_11":
+            min_past_2 = min(3, max(1, self.cfg.n_layers - 1))
+            self.split_anc_layers = list(range(min_past_2, self.cfg.n_layers))
+            self.valid_layer_pairs = [(min(early_layer, max(1, la - 1)), la) for la in self.split_anc_layers]
             tracked_layers = sorted(set(self.split_anc_layers) | {early_layer, anchor_layer})
         else:
             self.valid_layer_pairs = [(early_layer, anchor_layer)]
@@ -1387,7 +1399,7 @@ class CausalAblationJLensController:
 
         ear_l = self.early_layer if early_layer is None else early_layer
         anc_l = self.anchor_layer if anchor_layer is None else anchor_layer
-        if self.layer_mode == "split_6_9" and not self.enable_early and self.split_anc_layers:
+        if self.layer_mode in ("split_6_9", "split_3_11") and not self.enable_early and self.split_anc_layers:
             n_kv_blk  = float(self.cfg.n_layers - min(self.split_anc_layers))
             n_anc_blk = sum(float(self.cfg.n_layers - l) for l in self.split_anc_layers) / float(len(self.split_anc_layers))
             n_ear_blk = 0.0
@@ -1695,14 +1707,22 @@ class CausalAblationJLensController:
             lq_sel_anc    = lens_anc.selected_log_probs(x_anc_live, ids_a)
             gold_vec      = None
 
+        u_abs_cl = u_anc.clamp(-0.6, 0.6).abs()
+        if self.bystander_rel_tau > 0.0:
+            mean_ul = float((u_abs_cl * usable_a.float()).sum().item()) / max(1.0, float(usable_a.float().sum().item()))
+            tau_eff = max(self.bystander_tau, self.bystander_rel_tau * mean_ul)
+        else:
+            tau_eff = self.bystander_tau
+
         vec_anc = compute_feature_loss_pregathered(
             lq_sel_anc, u_anc, usable_a, loss_kind=self.loss_kind, exp_beta=self.exp_beta,
-            exp_norm=self.exp_norm, bystander_tau=self.bystander_tau, bystander_w=self.bystander_w,
+            exp_norm=self.exp_norm, bystander_tau=tau_eff, bystander_w=self.bystander_w,
             bystander_unscaled=self.bystander_unscaled,
         )
         if gold_vec is not None:
             vec_anc = vec_anc + gold_vec
-        return vec_anc, ids_a, u_anc, usable_a, val_a
+        bys_mask_a = (u_abs_cl < tau_eff) & usable_a if tau_eff > 0.0 else torch.zeros_like(usable_a)
+        return vec_anc, ids_a, u_anc, usable_a, val_a, bys_mask_a
 
     @torch._dynamo.disable
     def compute_loss(
@@ -1746,8 +1766,8 @@ class CausalAblationJLensController:
         else:
             live_nw = live_u_bf = live_u_fp = None
 
-        # --- Multi-Layer Shared-KV Split-Batch Mode (`split_6_9`, `enable_early == False`) ---
-        if self.layer_mode == "split_6_9" and not self.enable_early and self.split_anc_layers:
+        # --- Multi-Layer Shared-KV Split-Batch Mode (`split_6_9` / `split_3_11`, `enable_early == False`) ---
+        if self.layer_mode in ("split_6_9", "split_3_11") and not self.enable_early and self.split_anc_layers:
             min_anc = min(self.split_anc_layers)
             with torch.no_grad():
                 kv_base = kv_fn(
@@ -1758,13 +1778,13 @@ class CausalAblationJLensController:
                 perm = torch.randperm(N_act, device=yb.device)
                 chunks = torch.chunk(perm, len(self.split_anc_layers))
 
-            vec_parts, u_parts, usa_parts, val_parts = [], [], [], []
+            vec_parts, u_parts, usa_parts, val_parts, bys_parts = [], [], [], [], []
             for idx_c, l_anc in zip(chunks, self.split_anc_layers):
                 if idx_c.numel() == 0:
                     continue
                 # Sorting `idx_c` preserves strict ascending `(b_each, pos_each)` and monotonic `kv_slot` for `build_seq_groups`!
                 sub = idx_c.sort()[0]
-                v_l, _, u_l, us_l, vl_l = self._eval_anchor_group(
+                v_l, _, u_l, us_l, vl_l, bm_l = self._eval_anchor_group(
                     raw_model, interm, l_anc, kv_base[l_anc - min_anc :],
                     b_each[sub], pos_each[sub], kv_slot[sub], yb, tok_nll_2d,
                     sup_fn, adv_fn, live_nw, live_u_bf, live_u_fp,
@@ -1773,18 +1793,20 @@ class CausalAblationJLensController:
                 u_parts.append(u_l)
                 usa_parts.append(us_l)
                 val_parts.append(vl_l)
+                bys_parts.append(bm_l)
             del kv_base
 
             vec_anc        = torch.cat(vec_parts, dim=0)
             u_anc          = torch.cat(u_parts, dim=0)
             usable_a       = torch.cat(usa_parts, dim=0)
             val_a          = torch.cat(val_parts, dim=0)
+            bys_mask_a     = torch.cat(bys_parts, dim=0)
             loss_anc_mean  = vec_anc.mean()
             loss_anc_batch = vec_anc.sum() * inv_m_tot
             cur_ear, cur_anc = self.early_layer, self.anchor_layer
             ids_a = None
         else:
-            if self.layer_mode in ("random_gap4", "random_anc_7_10"):
+            if self.layer_mode in ("random_gap4", "random_anc_7_10", "random_3_11"):
                 p_idx = int(torch.randint(0, len(self.valid_layer_pairs), (1,), generator=self.pair_rng).item())
                 cur_ear, cur_anc = self.valid_layer_pairs[p_idx]
             else:
@@ -1795,7 +1817,7 @@ class CausalAblationJLensController:
                 anc_inputs = [interm[m - 1].detach() for m in range(cur_anc, self.cfg.n_layers)]
                 kv_anc = kv_fn(anc_blocks, anc_inputs, uniq_b, raw_model.cos, raw_model.sin)
 
-            vec_anc, ids_a, u_anc, usable_a, val_a = self._eval_anchor_group(
+            vec_anc, ids_a, u_anc, usable_a, val_a, bys_mask_a = self._eval_anchor_group(
                 raw_model, interm, cur_anc, kv_anc,
                 b_each, pos_each, kv_slot, yb, tok_nll_2d,
                 sup_fn, adv_fn, live_nw, live_u_bf, live_u_fp,
@@ -1924,7 +1946,7 @@ class CausalAblationJLensController:
         tot_aux  = 0.5 * (loss_anc_batch + loss_ear_batch) if self.enable_early else loss_anc_batch
         tot_obs  = (0.5 * (loss_anc_mean + loss_ear_mean) if self.enable_early else loss_anc_mean).detach()
         n_usa_a  = max(1.0, float(usable_a.float().sum().item()))
-        bys_frac = float(((u_anc.clamp(-0.6, 0.6).abs() < self.bystander_tau) & usable_a).float().sum().item()) / n_usa_a if self.bystander_tau > 0.0 else 0.0
+        bys_frac = float(bys_mask_a.float().sum().item()) / n_usa_a
         stats = {
             "l_ear": int(cur_ear),
             "l_anc": int(cur_anc),
