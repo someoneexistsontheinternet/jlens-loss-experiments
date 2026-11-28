@@ -18,7 +18,7 @@ FLS_BIN   = os.environ.get("FEATHERLESS_BIN", str(Path.home() / ".local/bin/feat
 def main():
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        [FLS_BIN, "volume", "sync", "--mode", "download", "--mkdirs", "--include", "*.jsonl.gz",
+        [FLS_BIN, "volume", "sync", "--mode", "download", "--force", "--mkdirs", "--include", "*.jsonl.gz",
          str(LOGS_DIR), "vol://jlens-data/logs", "--non-interactive"],
         cwd=REPO_ROOT, check=False,
     )
@@ -56,7 +56,7 @@ def main():
         jmode = meta.get("jlens_mode", summary.get("jlens_mode", "none"))
         kind  = meta.get("kind", summary.get("kind", "train"))
 
-        if jmode == "ablation" or gz_path.name.startswith(("05", "06", "07")):
+        if jmode == "ablation" or gz_path.name.startswith(("05", "06", "07", "08", "09")):
             tot_phase4_gpu_h += gpu_h
         elif jmode and jmode != "none":
             tot_jlens_gpu_h += gpu_h

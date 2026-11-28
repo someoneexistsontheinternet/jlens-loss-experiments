@@ -33,7 +33,7 @@ class NanoGPT70MConfig:
     jlens_mode: str     = "none"   # "none" | "wave8" | "ablation"
     jlens_weight: float = 0.35
     ce_backend: str     = "triton" # "triton" (fused in-place row softcap CE) | "eager"
-    ce_chunk_sz: int    = 16384    # High-MFU MFMA tile occupancy with 1-pass VGPR Softcap-CE
+    ce_chunk_sz: int    = 16384    # Matched to Wave 4.1 (062-068)
     fused_block_ops: bool = True   # Fused Triton QKNorm+RoPE+BHTD & SwiGLU
 
 

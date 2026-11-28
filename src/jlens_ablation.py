@@ -26,9 +26,10 @@ import triton.language as tl
 from model_70m import apply_rope
 from fast_kernels import (
     _softcap_lse_2half_reg_kernel,
+    _softcap_target_nll_2half_reg_kernel,
     extract_clean_kv_fast,
-    advance_local_window_kv_fast,
 )
+from ultra_probe_kernels import advance_local_window_kv_ultra
 
 RHO_HARMONIC = 3.0 / math.sqrt(5.0 * math.pi)  # 0.75694...
 EOT_TOKEN    = 50256
@@ -346,7 +347,7 @@ class FrozenSoftcapReadout(nn.Module):
             return _SelectedSoftcapLinearLogProbsFn.apply(hn, self.U_bf16, ids_2d, self.softcap, 16384)
 
     @torch.no_grad()
-    def fast_nograd_target_nll(self, h_2d: Tensor, targets_1d: Tensor, chunk_sz: int = 16384) -> Tensor:
+    def fast_nograd_target_nll(self, h_2d: Tensor, targets_1d: Tensor, chunk_sz: int = 32768) -> Tensor:
         if not h_2d.is_cuda or self.U_bf16.shape[0] < 1024:
             return F.cross_entropy(self.logits(h_2d), targets_1d, reduction="none")
         N, D = h_2d.shape
@@ -357,7 +358,7 @@ class FrozenSoftcapReadout(nn.Module):
         hn_all = FusedRMSNormFn.apply(h_2d.to(torch.bfloat16), self.norm_w, self.eps) if D == 512 else None
         out_nll = torch.empty((N,), dtype=torch.float32, device=h_2d.device)
         buf = torch.empty((min(N, chunk_sz), V), dtype=torch.bfloat16, device=h_2d.device)
-        lse = torch.empty((min(N, chunk_sz),), dtype=torch.float32, device=h_2d.device)
+        lse = None if use_2half else torch.empty((min(N, chunk_sz),), dtype=torch.float32, device=h_2d.device)
         for s in range(0, N, chunk_sz):
             e = min(s + chunk_sz, N)
             nr = e - s
@@ -367,19 +368,20 @@ class FrozenSoftcapReadout(nn.Module):
                 hf = h_2d[s:e].float()
                 hn = (hf * torch.rsqrt(hf.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.norm_w).to(torch.bfloat16)
             b_sl = buf[:nr]
-            l_sl = lse[:nr]
             torch.matmul(hn, self.U_bf16.t(), out=b_sl)
             if use_2half:
-                _softcap_lse_2half_reg_kernel[(nr,)](
-                    b_sl, b_sl.stride(0), l_sl, V=V, SOFTCAP=self.softcap, INV_SOFTCAP=inv_sc, HALF_V=32768, num_warps=8
+                _softcap_target_nll_2half_reg_kernel[(nr,)](
+                    b_sl, b_sl.stride(0), targets_1d[s:e], out_nll[s:e],
+                    V=V, SOFTCAP=self.softcap, INV_SOFTCAP=inv_sc, HALF_V=32768, num_warps=8,
                 )
             else:
+                l_sl = lse[:nr]
                 _softcap_lse_nograd_kernel[(nr,)](
                     b_sl, b_sl.stride(0), l_sl, V=V, SOFTCAP=self.softcap, INV_SOFTCAP=inv_sc, BLOCK_V=4096, num_warps=8
                 )
-            raw_t = b_sl.gather(1, targets_1d[s:e].unsqueeze(1)).squeeze(1).float()
-            lg_t = (self.softcap * torch.tanh(raw_t * inv_sc)) if self.softcap > 0.0 else raw_t
-            out_nll[s:e] = l_sl - lg_t
+                raw_t = b_sl.gather(1, targets_1d[s:e].unsqueeze(1)).squeeze(1).float()
+                lg_t = (self.softcap * torch.tanh(raw_t * inv_sc)) if self.softcap > 0.0 else raw_t
+                out_nll[s:e] = l_sl - lg_t
         return out_nll
 
     @torch.no_grad()
@@ -591,6 +593,8 @@ def suppress_oblique_single_and_joint(
 
         probes = torch.cat([xf.unsqueeze(1), ed_k, ed_all.unsqueeze(1)], dim=1).to(x.dtype)
         return probes, usable_k, usable_all
+
+_compiled_suppress_oblique = torch.compile(suppress_oblique_single_and_joint, dynamic=True)
 
 
 def compute_feature_loss_pregathered(
@@ -1080,7 +1084,16 @@ class CausalAblationJLensController:
         c_sz  = self.pos_chunk_sz
         use_fast_gpu = yb.is_cuda and (self.cfg.head_dim == 64) and (self.cfg.d_model == 512)
         kv_fn  = extract_clean_kv_fast if use_fast_gpu else extract_clean_kv_for_blocks
-        adv_fn = advance_local_window_kv_fast if use_fast_gpu else advance_local_window_kv
+        sup_fn = _compiled_suppress_oblique if use_fast_gpu else suppress_oblique_single_and_joint
+        if use_fast_gpu:
+            def adv_fn(blocks, kv_list, h_win, positions, cos_full, sin_full, kv_slot):
+                wpe = 2 if h_win.shape[2] > 1 else 0
+                return advance_local_window_kv_ultra(
+                    blocks, kv_list, h_win, positions, cos_full, sin_full, kv_slot,
+                    block_t=64, num_warps=4, waves_per_eu=wpe,
+                )
+        else:
+            adv_fn = advance_local_window_kv
 
         # --- 1. Anchor Layer (`cur_anc .. n_layers`, window `W`) ---
         h_anc_seq = interm[cur_anc - 1]
@@ -1107,7 +1120,7 @@ class CausalAblationJLensController:
             for s in range(0, N_act, c_sz):
                 e = min(s + c_sz, N_act)
                 nc = e - s
-                probes_c, usa_c, usa_all_c = suppress_oblique_single_and_joint(
+                probes_c, usa_c, usa_all_c = sup_fn(
                     x_anc_live[s:e].detach(), w_a[s:e], d_a[s:e], val_a[s:e],
                     strength=self.strength, match_norm=self.match_norm,
                 )
@@ -1175,7 +1188,7 @@ class CausalAblationJLensController:
                 for s in range(0, N_act, c_sz):
                     e = min(s + c_sz, N_act)
                     nc = e - s
-                    probes_ec, usa_ec, usa_all_ec = suppress_oblique_single_and_joint(
+                    probes_ec, usa_ec, usa_all_ec = sup_fn(
                         x_ear_live[s:e].detach(), w_e[s:e], d_e[s:e], val_e[s:e],
                         strength=self.strength, match_norm=self.match_norm,
                     )

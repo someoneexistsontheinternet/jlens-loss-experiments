@@ -452,18 +452,33 @@ class FastChunkedSoftcapCEFn(torch.autograd.Function):
     def forward(ctx, h_2d: Tensor, w_vocab: Tensor, targets_1d: Tensor, softcap: float, chunk_sz: int = 4096, use_1pass_reg: bool = True):
         M, D = h_2d.shape
         V = w_vocab.shape[0]
-        inv_m = 1.0 / float(M)
-
-        dh = torch.empty((M, D), dtype=torch.bfloat16, device=h_2d.device)
-        dw = torch.zeros((V, D), dtype=torch.float32, device=h_2d.device)
-        dw_tmp = torch.empty((V, D), dtype=torch.bfloat16, device=h_2d.device)
-        nll_out = torch.empty((M,), dtype=torch.float32, device=h_2d.device)
-
         w_bf = w_vocab if w_vocab.dtype == torch.bfloat16 else w_vocab.to(torch.bfloat16)
         h_bf = h_2d if h_2d.dtype == torch.bfloat16 else h_2d.to(torch.bfloat16)
         inv_sc = (1.0 / softcap) if softcap > 0.0 else 0.0
+        nll_out = torch.empty((M,), dtype=torch.float32, device=h_2d.device)
         max_rows = min(M, chunk_sz)
         logits_buf = torch.empty((max_rows, V), dtype=torch.bfloat16, device=h_2d.device)
+
+        if not torch.is_grad_enabled():
+            for s in range(0, M, chunk_sz):
+                e = min(s + chunk_sz, M)
+                n_r = e - s
+                buf = logits_buf[:n_r]
+                torch.matmul(h_bf[s:e], w_bf.t(), out=buf)
+                if 32768 < V <= 65536:
+                    _softcap_target_nll_2half_reg_kernel[(n_r,)](
+                        buf, buf.stride(0), targets_1d[s:e], nll_out[s:e],
+                        V=V, SOFTCAP=float(softcap), INV_SOFTCAP=float(inv_sc), HALF_V=32768, num_warps=8,
+                    )
+                else:
+                    lg = (softcap * torch.tanh(buf.float() * inv_sc)) if softcap > 0.0 else buf.float()
+                    nll_out[s:e] = torch.logsumexp(lg, dim=-1) - lg.gather(1, targets_1d[s:e].unsqueeze(1)).squeeze(1)
+            return nll_out.mean(), nll_out
+
+        inv_m = 1.0 / float(M)
+        dh = torch.empty((M, D), dtype=torch.bfloat16, device=h_2d.device)
+        dw = torch.zeros((V, D), dtype=torch.float32, device=h_2d.device)
+        dw_tmp = torch.empty((V, D), dtype=torch.bfloat16, device=h_2d.device)
 
         from model_70m import _softcap_ce_fwd_bwd_inplace_kernel
         for s in range(0, M, chunk_sz):
@@ -775,6 +790,45 @@ def _softcap_lse_2half_reg_kernel(
     m_all = tl.maximum(m0, m1)
     d_all = d0 * tl.math.exp2((m0 - m_all) * LOG2E) + tl.sum(tl.math.exp2((lg1 - m_all) * LOG2E), axis=0)
     tl.store(lse_ptr + row, m_all + tl.math.log(d_all))
+
+
+@triton.jit
+def _softcap_target_nll_2half_reg_kernel(
+    logits_ptr, stride_m, targets_ptr, nll_ptr,
+    V: tl.constexpr, SOFTCAP: tl.constexpr, INV_SOFTCAP: tl.constexpr, HALF_V: tl.constexpr,
+):
+    """Fused 1-pass `logsumexp(softcap(raw)) - softcap(raw[tgt])` in registers (eliminates gather+tanh+sub kernels)."""
+    row = tl.program_id(0).to(tl.int64)
+    row_ptr = logits_ptr + row * stride_m
+    tgt = tl.load(targets_ptr + row)
+    offs0 = tl.arange(0, HALF_V)
+    offs1 = HALF_V + offs0
+    mask1 = offs1 < V
+    LOG2E: tl.constexpr = 1.4426950408889634
+
+    f0 = tl.load(row_ptr + offs0).to(tl.float32)
+    f1 = tl.load(row_ptr + offs1, mask=mask1, other=-float("inf")).to(tl.float32)
+    if SOFTCAP > 0.0:
+        z0 = tl.minimum(tl.maximum(f0 * INV_SOFTCAP, -20.0), 20.0)
+        e0 = tl.math.exp2(2.0 * LOG2E * z0)
+        lg0 = SOFTCAP * ((e0 - 1.0) / (e0 + 1.0))
+        z1 = tl.minimum(tl.maximum(f1 * INV_SOFTCAP, -20.0), 20.0)
+        e1 = tl.math.exp2(2.0 * LOG2E * z1)
+        lg1 = tl.where(mask1, SOFTCAP * ((e1 - 1.0) / (e1 + 1.0)), -float("inf"))
+    else:
+        lg0 = f0
+        lg1 = tl.where(mask1, f1, -float("inf"))
+
+    m0 = tl.max(lg0, axis=0)
+    d0 = tl.sum(tl.math.exp2((lg0 - m0) * LOG2E), axis=0)
+    lgt0 = tl.sum(tl.where(offs0 == tgt, lg0, 0.0), axis=0)
+
+    m1 = tl.max(lg1, axis=0)
+    m_all = tl.maximum(m0, m1)
+    d_all = d0 * tl.math.exp2((m0 - m_all) * LOG2E) + tl.sum(tl.math.exp2((lg1 - m_all) * LOG2E), axis=0)
+    lse   = m_all + tl.math.log(d_all)
+    lgt1  = tl.sum(tl.where(offs1 == tgt, lg1, 0.0), axis=0)
+    tl.store(nll_ptr + row, lse - (lgt0 + lgt1))
 
 
 def _merge_local_window_impl(
